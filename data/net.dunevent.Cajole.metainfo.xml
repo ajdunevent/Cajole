@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>net.dunevent.Cajole</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Cajole</name>
+  <summary>A gentle alarm clock for Phosh</summary>
+  <developer id="net.dunevent">
+    <name>AJ Dunevent</name>
+  </developer>
+  <url type="homepage">https://dev.dunevent.net/aj/Cajole</url>
+  <url type="vcs-browser">https://dev.dunevent.net/aj/Cajole</url>
+  <url type="bugtracker">https://dev.dunevent.net/aj/Cajole/issues</url>
+  <url type="donation">https://paypal.me/ajdunevent</url>
+  <description>
+    <p>
+      Cajole is an alarm clock for GNOME-based Linux phones. Alarms ramp up
+      gradually through volume, vibration and screen glow, and can be
+      dismissed early from a notification before they ring.
+    </p>
+    <ul>
+      <li>GNOME Clocks-style time picker</li>
+      <li>Gentle wake ramps for volume, vibration and screen brightness</li>
+      <li>Early-dismissal notifications</li>
+      <li>Holiday Mode for pausing regular alarms and adding temporary ones</li>
+      <li>Downloadable sounds and custom sound files</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">net.dunevent.Cajole.desktop</launchable>
+  <content_rating type="oars-1.1"/>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+  <releases>
+    <release version="0.1.1" date="2026-09-14"/>
+  </releases>
+</component>

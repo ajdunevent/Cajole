@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Cajole
+Comment=A gentle, mobile-first alarm clock
+Exec=cajole
+Icon=net.dunevent.Cajole
+Terminal=false
+Categories=GNOME;GTK;Utility;Clock;
+StartupNotify=true
+X-GNOME-UsesNotifications=true

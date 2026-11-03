@@ -1,0 +1,71 @@
+{
+    "app-id": "net.dunevent.Cajole",
+    "runtime": "org.gnome.Platform",
+    "runtime-version": "51",
+    "sdk": "org.gnome.Sdk",
+    "sdk-extensions": [
+        "org.freedesktop.Sdk.Extension.rust-stable"
+    ],
+    "command": "cajole",
+    "finish-args": [
+        "--share=ipc",
+        "--share=network",
+        "--socket=wayland",
+        "--socket=fallback-x11",
+        "--socket=pulseaudio",
+        "--device=dri",
+        "--talk-name=org.sigxcpu.Feedback",
+        "--talk-name=org.mpris.MediaPlayer2.*",
+        "--talk-name=org.gnome.SettingsDaemon.Power",
+        "--system-talk-name=org.freedesktop.login1",
+        "--system-talk-name=de.seath.Waked",
+        "--talk-name=org.gnome.Mutter.DisplayConfig",
+        "--talk-name=org.gnome.Shell.Brightness",
+        "--talk-name=org.gnome.Mutter.IdleMonitor",
+        "--talk-name=ca.desrt.dconf",
+        "--filesystem=xdg-run/dconf",
+        "--filesystem=~/.config/dconf:ro",
+        "--env=DCONF_USER_CONFIG_DIR=.config/dconf",
+        "--talk-name=org.gnome.SessionManager"
+    ],
+    "build-options": {
+        "append-path": "/usr/lib/sdk/rust-stable/bin"
+    },
+    "modules": [
+        {
+            "name": "cajole",
+            "buildsystem": "simple",
+            "build-options": {
+                "build-args": [
+                    "--share=network"
+                ],
+                "env": {
+                    "CARGO_HOME": "/run/build/cajole/cargo"
+                }
+            },
+            "build-commands": [
+                "if [ -f Cargo.lock ]; then cargo build --release --locked; else cargo build --release; fi",
+                "install -Dm755 target/release/cajole /app/bin/cajole",
+                "install -Dm644 data/net.dunevent.Cajole.desktop /app/share/applications/net.dunevent.Cajole.desktop",
+                "install -Dm644 data/icons/hicolor/scalable/apps/net.dunevent.Cajole.svg /app/share/icons/hicolor/scalable/apps/net.dunevent.Cajole.svg",
+                "install -Dm644 data/icons/hicolor/symbolic/apps/net.dunevent.Cajole-symbolic.svg /app/share/icons/hicolor/symbolic/apps/net.dunevent.Cajole-symbolic.svg",
+                "install -Dm644 data/net.dunevent.Cajole.metainfo.xml /app/share/metainfo/net.dunevent.Cajole.metainfo.xml",
+                "install -Dm644 data/flatpak/org.gnome.settings-daemon.plugins.power.gschema.xml /app/share/glib-2.0/schemas/org.gnome.settings-daemon.plugins.power.gschema.xml",
+                "glib-compile-schemas /app/share/glib-2.0/schemas"
+            ],
+            "sources": [
+                {
+                    "type": "dir",
+                    "path": "..",
+                    "skip": [
+                        "target",
+                        "dist",
+                        ".flatpak",
+                        ".flatpak-builder",
+                        ".git"
+                    ]
+                }
+            ]
+        }
+    ]
+}

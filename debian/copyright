@@ -1,0 +1,42 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: cajole
+Upstream-Contact: AJ Dunevent <aj@dunevent.net>
+Source: https://dev.dunevent.net/aj/Cajole
+
+Files: *
+Copyright: 2026 Cajole contributors
+License: GPL-3.0-or-later
+
+Comment: The Sound Manager's downloadable catalog (src/sound_library.rs)
+ references dozens of sounds from GNOME Clocks, AOSP, and KDE
+ Plasma/Plasma Mobile under CC0-1.0, CC-BY-3.0, CC-BY-4.0, CC-BY-SA-4.0,
+ and Apache-2.0. None of them are bundled in this package or fetched
+ during the build — they're downloaded on request, into the user's own
+ data directory, only if that specific sound is selected, and none are
+ pre-selected or otherwise provided by default. Each carries its own
+ attribution and license inside the app itself (an info popover on its
+ row in the Sound Manager), sourced individually from each project's own
+ credits/license files rather than assumed. See sound_library.rs's own
+ `default_catalog` function for the complete, per-entry breakdown.
+
+Comment: This package's Rust dependencies (declared in Cargo.toml, not
+ vendored into this source package) are fetched from crates.io at build
+ time under their own individual licenses — predominantly MIT and/or
+ Apache-2.0, the Rust ecosystem's near-universal convention, though this
+ isn't exhaustively verified per-crate here. Inspect the exact set with
+ `cargo license` (from the cargo-license crate) against Cargo.lock for a
+ complete, current accounting if needed.
+
+License: GPL-3.0-or-later
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or (at
+ your option) any later version.
+ .
+ This program is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ General Public License for more details.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 3 can be found in "/usr/share/common-licenses/GPL-3".

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/net/dunevent/Cajole/icons/symbolic/apps">
+    <file alias="sentiment-satisfied-symbolic.svg">icons/sentiment-satisfied-symbolic.svg</file>
+    <file alias="music-note-outline-symbolic.svg">icons/music-note-outline-symbolic.svg</file>
+    <file alias="phone-vibrate-symbolic.svg">icons/phone-vibrate-symbolic.svg</file>
+    <file alias="image-adjust-brightness-symbolic.svg">icons/image-adjust-brightness-symbolic.svg</file>
+  </gresource>
+</gresources>

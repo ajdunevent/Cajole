@@ -1,0 +1,117 @@
+[package]
+name = "cajole"
+version = "0.1.1"
+edition = "2021"
+authors = ["AJ Dunevent"]
+license = "GPL-3.0-or-later"
+description = "Gentle, mobile-first alarm clock for GTK4/libadwaita Linux phones."
+
+[package.metadata.deb]
+# `lintian` flags two warnings on the built .deb, both accepted,
+# won't-fix: `initial-upload-closes-no-bugs` is purely an official-
+# Debian-archive submission convention (expects an ITP bug reference),
+# irrelevant to this pragmatic, non-archive package. `no-manual-page`
+# is real but low-priority polish for this project's actual scope.
+changelog = "debian/changelog"
+maintainer = "AJ Dunevent <aj@dunevent.net>"
+copyright = "2026, AJ Dunevent"
+extended-description = """\
+Cajole is a GTK4/libadwaita alarm clock built for GNOME-based Linux \
+phones (Phosh/FuriOS and similar), with a GNOME Clocks-style time \
+picker, gentle-wake ramping (volume, vibration, and screen glow), \
+early-dismissal notifications, and reliable background alarm delivery \
+via a systemd-timer-based wake mechanism.
+
+It runs continuously in the background once started, ringing alarms \
+through direct audio playback rather than depending on the system's \
+notification theme having a sound configured for every event."""
+# "$auto" is dpkg-shlibdeps's own real, computed shared-library
+# dependencies (confirmed correct via earlier dpkg-buildpackage testing —
+# it inspects the actual compiled binary, not a guess). Everything after
+# it is what $auto can't know about: subprocess tools this app shells
+# out to directly (paplay/pactl, curl, systemd-run/systemctl, gdbus).
+# "$auto" is dpkg-shlibdeps's own real, computed shared-library
+# dependencies (confirmed correct via earlier dpkg-buildpackage testing —
+# it inspects the actual compiled binary, not a guess). Everything after
+# it is what $auto can't know about: subprocess tools this app shells
+# out to directly (paplay/pactl, curl, systemd-run/systemctl, gdbus), and
+# librsvg2-common specifically for a real, confirmed reason — GTK4/
+# libadwaita being installed does NOT guarantee SVG icons actually
+# render. Verified directly, hands-on: with librsvg2-common genuinely
+# absent, both of Cajole's own real icons (app + symbolic) silently fell
+# back to the generic broken-image glyph everywhere they're used (the
+# About dialog, the "No Alarms" empty state), while `has_icon()` still
+# reported true the whole time — the icon is indexed by name either way,
+# but actually decoding SVG into pixels needs this specific gdk-pixbuf
+# loader plugin, which our binary loads dynamically at runtime rather
+# than linking directly, so dpkg-shlibdeps has no way to see it.
+depends = "$auto, pulseaudio-utils | pipewire-pulse, curl, libglib2.0-bin, systemd, librsvg2-common"
+# feedbackd specifically isn't a hard Depends — the app has real,
+# working fallback behavior without it (see feedback.rs/ring.rs). It's
+# also deliberately Suggests, not Recommends: apt installs Recommends
+# by *default* on virtually every real install (confirmed directly —
+# it pulled in feedbackd's entire chain, libcanberra/sound-theme-
+# freedesktop included, in an unprompted dry-run test), which is too
+# strong for a package whose only value here is vibration for Gentle
+# Wake — a phone-specific feature, not something a plain desktop
+# install benefits from. On the actual target platform (FuriOS/Phosh)
+# feedbackd is already part of the base system regardless, so nothing
+# is lost there by not forcing the install elsewhere.
+# Not adwaita-icon-theme — checked directly rather than assumed: it's
+# already an unconditional hard Depends of libgtk-4-1 itself (which
+# ${shlibs:Depends} below already pulls in), so declaring it again here
+# would just be redundant, not something actually adding any guarantee.
+suggests = "feedbackd"
+section = "gnome"
+priority = "optional"
+assets = [
+    { source = "target/release/cajole", dest = "usr/bin/", mode = "755" },
+    { source = "data/net.dunevent.Cajole.desktop", dest = "usr/share/applications/net.dunevent.Cajole.desktop", mode = "644" },
+    # The .desktop file's Icon=net.dunevent.Cajole now depends on us
+    # actually shipping these — unlike the placeholder alarm-symbolic it
+    # replaced, this app ID isn't a system theme icon that's already
+    # guaranteed present some other way. Installed under the standard
+    # hicolor theme tree; hicolor-icon-theme's own dpkg trigger (a base
+    # package present on virtually every system) picks up the new files
+    # and refreshes the icon cache automatically, no extra step needed
+    # from this package itself.
+    { source = "data/icons/hicolor/scalable/apps/net.dunevent.Cajole.svg", dest = "usr/share/icons/hicolor/scalable/apps/net.dunevent.Cajole.svg", mode = "644" },
+    { source = "data/icons/hicolor/symbolic/apps/net.dunevent.Cajole-symbolic.svg", dest = "usr/share/icons/hicolor/symbolic/apps/net.dunevent.Cajole-symbolic.svg", mode = "644" },
+    # Placed explicitly, not left to cargo-deb's own auto-generated
+    # stub (which only pulls name/license/authors from Cargo.toml) —
+    # this is the real, hand-written copyright file accounting for the
+    # bundled CC-BY-4.0 sound's own separate attribution requirement,
+    # which an auto-generated file would silently lose.
+    { source = "debian/copyright", dest = "usr/share/doc/cajole/copyright", mode = "644" },
+]
+
+[lib]
+name = "cajole"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cajole"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", features = ["clock", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+gtk4 = { version = "0.9", package = "gtk4", features = ["v4_10"] }
+adw = { version = "0.7", package = "libadwaita", features = ["v1_5"] }
+gio = "0.20"
+glib = "0.20"
+libc = "0.2"
+async-channel = "2"
+
+# Used by build-aux/dev.sh. Release without most of its optimization time.
+[profile.release-dev]
+inherits = "release"
+opt-level = 2
+incremental = true
+codegen-units = 256
