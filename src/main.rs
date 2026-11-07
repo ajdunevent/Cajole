@@ -3700,14 +3700,14 @@ fn show_about_dialog(parent: &adw::ApplicationWindow) {
         .application_icon("net.dunevent.Cajole")
         .version(env!("CARGO_PKG_VERSION"))
         .developer_name("Cajole contributors")
+        .developers(["AJ Dunevent"])
         .copyright("\u{a9} 2026 Cajole contributors")
         .license_type(gtk4::License::Gpl30)
         .comments("A gentle, mobile-first alarm clock for GTK4/libadwaita Linux phones.")
         .website("https://dev.dunevent.net/aj/Cajole")
         .issue_url("https://dev.dunevent.net/aj/Cajole/issues")
         .build();
-    about.add_link("Donate", "https://paypal.me/ajdunevent");
-    about.add_link("Fediverse", "https://social.dunevent.net/@aj");
+    about.add_link("Donate", "https://dunevent.net/donate");
 
     // Each of these is an on-demand Sound Manager source. None is bundled or
     // distributed with this package, and nothing is pre-installed; a person

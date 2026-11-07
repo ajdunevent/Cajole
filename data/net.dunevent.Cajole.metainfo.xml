@@ -6,12 +6,13 @@
   <name>Cajole</name>
   <summary>A gentle alarm clock for Phosh</summary>
   <developer id="net.dunevent">
-    <name>AJ Dunevent</name>
+    <name>Cajole contributors</name>
   </developer>
   <url type="homepage">https://dev.dunevent.net/aj/Cajole</url>
   <url type="vcs-browser">https://dev.dunevent.net/aj/Cajole</url>
   <url type="bugtracker">https://dev.dunevent.net/aj/Cajole/issues</url>
-  <url type="donation">https://paypal.me/ajdunevent</url>
+  <url type="donation">https://dunevent.net/donate</url>
+  <update_contact>aj@dunevent.net</update_contact>
   <description>
     <p>
       Cajole is an alarm clock for GNOME-based Linux phones. Alarms ramp up
@@ -28,6 +29,10 @@
   </description>
   <launchable type="desktop-id">net.dunevent.Cajole.desktop</launchable>
   <content_rating type="oars-1.1"/>
+  <branding>
+    <color type="primary" scheme_preference="light">#f9f06b</color>
+    <color type="primary" scheme_preference="dark">#3d3846</color>
+  </branding>
   <requires>
     <display_length compare="ge">360</display_length>
   </requires>
@@ -37,6 +42,33 @@
     <control>touch</control>
   </supports>
   <releases>
-    <release version="0.1.1" date="2026-09-14"/>
+    <release version="0.1.2" date="2026-11-07">
+      <description>
+        <p>Metainfo updates.</p>
+        <ul>
+          <li>New donation link and an update contact</li>
+          <li>Developer shown as Cajole contributors</li>
+          <li>Brand colours, and notes for earlier releases</li>
+          <li>The About dialog uses the new donation link</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.1.1" date="2026-09-14">
+      <description>
+        <p>The app icon is resized to match other GNOME app icons.</p>
+      </description>
+    </release>
+    <release version="0.1.0" date="2026-08-25">
+      <description>
+        <p>First release.</p>
+        <ul>
+          <li>A GNOME Clocks-style time picker and alarm list</li>
+          <li>Gentle wake: volume, vibration and screen brightness ramp up</li>
+          <li>Early-dismissal notifications before an alarm rings</li>
+          <li>Holiday Mode for pausing regular alarms and adding temporary ones</li>
+          <li>Downloadable alarm sounds and custom sound files</li>
+        </ul>
+      </description>
+    </release>
   </releases>
 </component>

@@ -1,3 +1,11 @@
+cajole (0.1.2-1) unstable; urgency=medium
+
+  * Metainfo updates: new donation link, update contact, developer name,
+    brand colours and release notes; the About dialog uses the new
+    donation link.
+
+ -- AJ Dunevent <aj@dunevent.net>  Sat, 07 Nov 2026 00:00:00 +0000
+
 cajole (0.1.1-1) unstable; urgency=medium
 
   * Resized the app icon's artwork to fill its canvas proportionally to
