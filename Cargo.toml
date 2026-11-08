@@ -14,7 +14,7 @@ description = "Gentle, mobile-first alarm clock for GTK4/libadwaita Linux phones
 # is real but low-priority polish for this project's actual scope.
 changelog = "debian/changelog"
 maintainer = "AJ Dunevent <aj@dunevent.net>"
-copyright = "2026, AJ Dunevent"
+copyright = "2026, Cajole contributors"
 extended-description = """\
 Cajole is a GTK4/libadwaita alarm clock built for GNOME-based Linux \
 phones (Phosh/FuriOS and similar), with a GNOME Clocks-style time \
