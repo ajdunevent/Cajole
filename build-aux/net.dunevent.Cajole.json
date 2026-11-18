@@ -26,12 +26,39 @@
         "--filesystem=xdg-run/dconf",
         "--filesystem=~/.config/dconf:ro",
         "--env=DCONF_USER_CONFIG_DIR=.config/dconf",
+        "--env=GIO_EXTRA_MODULES=/app/lib/gio/modules",
+        "--env=GSETTINGS_BACKEND=dconf",
         "--talk-name=org.gnome.SessionManager"
     ],
     "build-options": {
         "append-path": "/usr/lib/sdk/rust-stable/bin"
     },
     "modules": [
+        {
+            "name": "dconf",
+            "buildsystem": "meson",
+            "config-opts": [
+                "-Dbash_completion=false",
+                "-Dman=false",
+                "-Dvapi=false",
+                "-Dsystemduserunitdir=/app/lib/systemd/user"
+            ],
+            "cleanup": [
+                "/include",
+                "/lib/pkgconfig",
+                "/lib/systemd",
+                "/libexec",
+                "/share/dbus-1"
+            ],
+            "sources": [
+                {
+                    "type": "git",
+                    "url": "https://gitlab.gnome.org/GNOME/dconf.git",
+                    "tag": "51.0",
+                    "commit": "264e6598863fc1d9ad6edb4c58d86f82ea669927"
+                }
+            ]
+        },
         {
             "name": "cajole",
             "buildsystem": "simple",

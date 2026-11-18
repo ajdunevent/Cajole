@@ -1,3 +1,13 @@
+cajole (0.1.3-1) unstable; urgency=medium
+
+  * Pause automatic brightness during an alarm by changing the real
+    setting: build the dconf GIO module into the Flatpak and select it with
+    GSETTINGS_BACKEND.
+  * Restore automatic brightness at startup if an earlier run was killed
+    while it was paused.
+
+ -- AJ Dunevent <aj@dunevent.net>  Tue, 17 Nov 2026 00:00:00 +0000
+
 cajole (0.1.2-1) unstable; urgency=medium
 
   * Metainfo updates: new donation link, update contact, developer name,

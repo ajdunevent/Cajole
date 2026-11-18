@@ -238,6 +238,9 @@ fn main() -> glib::ExitCode {
             // sibling project Ripples ships.
             std::mem::forget(app.hold());
 
+            // A previous run killed mid-alarm can leave automatic brightness off.
+            cajole::auto_brightness::restore_pending();
+
             build_ui(app, hidden);
         }
 
