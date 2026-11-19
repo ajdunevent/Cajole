@@ -56,6 +56,10 @@
                     "url": "https://gitlab.gnome.org/GNOME/dconf.git",
                     "tag": "51.0",
                     "commit": "264e6598863fc1d9ad6edb4c58d86f82ea669927"
+                },
+                {
+                    "type": "patch",
+                    "path": "dconf-user-config-dir.patch"
                 }
             ]
         },

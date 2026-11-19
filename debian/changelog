@@ -1,3 +1,12 @@
+cajole (0.1.4-1) unstable; urgency=medium
+
+  * Patch the bundled dconf to honor DCONF_USER_CONFIG_DIR so Cajole reads
+    the host's real automatic brightness setting. Previously the read
+    returned nothing, so the setting was restored to its default (on) even
+    if the user had it off.
+
+ -- AJ Dunevent <aj@dunevent.net>  Wed, 18 Nov 2026 00:00:00 +0000
+
 cajole (0.1.3-1) unstable; urgency=medium
 
   * Pause automatic brightness during an alarm by changing the real

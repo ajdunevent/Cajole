@@ -42,6 +42,14 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.1.4" date="2026-11-18">
+      <description>
+        <p>Automatic brightness is now restored to its previous state after an alarm.</p>
+        <ul>
+          <li>Cajole can now read the real automatic brightness setting, so it no longer turns it on when you had it off</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.3" date="2026-11-17">
       <description>
         <p>Automatic brightness is now paused properly during an alarm.</p>
