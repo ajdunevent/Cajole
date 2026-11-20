@@ -42,6 +42,15 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.1.5" date="2026-11-19">
+      <description>
+        <p>Cajole now uses far less memory while it waits in the background.</p>
+        <ul>
+          <li>The alarm scheduler runs in a small background process, and the window opens in its own process that exits when you close it</li>
+          <li>The ring screen opens a moment after the alarm starts; the notification buttons still work instantly</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.4" date="2026-11-18">
       <description>
         <p>Automatic brightness is now restored to its previous state after an alarm.</p>

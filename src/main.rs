@@ -167,6 +167,94 @@ fn maybe_prompt_for_autostart(window: &adw::ApplicationWindow) {
     dialog.present(Some(window));
 }
 
+const UI_APP_ID: &str = "net.dunevent.Cajole.Ui";
+
+fn dbus_object_path(app_id: &str) -> String {
+    format!("/{}", app_id.replace('.', "/"))
+}
+
+/// Activates a GAction in the other Cajole process and does not wait. Neither
+/// process has a D-Bus service file, so `NO_AUTO_START` makes "not running"
+/// a quiet error instead of a launch.
+fn activate_remote_action(
+    app_id: &'static str,
+    action: &'static str,
+    parameter: Option<glib::Variant>,
+) {
+    glib::MainContext::default().spawn_local(async move {
+        let Ok(conn) = gio::bus_get_future(gio::BusType::Session).await else {
+            return;
+        };
+        let parameters: Vec<glib::Variant> = parameter.into_iter().collect();
+        let call = (action, parameters, HashMap::<String, glib::Variant>::new()).to_variant();
+        if let Err(err) = conn
+            .call_future(
+                Some(app_id),
+                &dbus_object_path(app_id),
+                "org.gtk.Actions",
+                "Activate",
+                Some(&call),
+                None,
+                gio::DBusCallFlags::NO_AUTO_START,
+                -1,
+            )
+            .await
+        {
+            tracing::debug!(%err, action, "remote action not delivered");
+        }
+    });
+}
+
+/// Starts another copy of this binary, which keeps running after this process
+/// exits.
+fn spawn_self(args: &[&str]) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut argv: Vec<&std::ffi::OsStr> = vec![exe.as_os_str()];
+    argv.extend(args.iter().map(std::ffi::OsStr::new));
+    if let Err(err) = gio::Subprocess::newv(&argv, gio::SubprocessFlags::NONE) {
+        tracing::warn!(%err, "failed to start {args:?}");
+    }
+}
+
+/// Shows the main window, or the ring screen for `ring`, in the UI process.
+fn launch_ui(ring: Option<Uuid>) {
+    match ring {
+        Some(id) => spawn_self(&["--ring", &id.to_string()]),
+        None => spawn_self(&[]),
+    }
+}
+
+/// The UI process's way to reach the scheduler in the background process.
+#[derive(Clone)]
+struct Backend;
+
+impl Backend {
+    /// Re-runs the schedule check after an alarm was saved, toggled or deleted.
+    fn request_reschedule(&self) {
+        activate_remote_action(APP_ID, "check-schedule", None);
+    }
+
+    /// As `request_reschedule`, and drops the alarm's cached next trigger,
+    /// which a changed time or repeat would not otherwise replace.
+    fn alarm_changed(&self, alarm_id: Uuid) {
+        activate_remote_action(APP_ID, "alarm-changed", Some(alarm_id.to_string().to_variant()));
+    }
+
+    /// Asks whether the alarm is still ringing; if not, the background process
+    /// tells the UI to close its ring screen.
+    fn ring_ui_ready(&self, alarm_id: Uuid) {
+        activate_remote_action(APP_ID, "ring-ui-ready", Some(alarm_id.to_string().to_variant()));
+    }
+
+    /// Snoozes or dismisses a ringing alarm; `action` is `snooze-alarm` or
+    /// `dismiss-alarm`.
+    fn ring_action(&self, action: &'static str, alarm_id: Uuid) {
+        activate_remote_action(APP_ID, action, Some(alarm_id.to_string().to_variant()));
+    }
+}
+
 fn main() -> glib::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -175,20 +263,480 @@ fn main() -> glib::ExitCode {
         )
         .init();
 
-    // `--hidden`: launched by the autostart entry at login, or by someone who
-    // wants the scheduler running without a window. The main window is never
-    // presented in this mode; see `build_ui`.
-    //
-    // `--gapplication-service` does not fit: it makes GIO skip `activate` at
-    // startup and wait for an external trigger, but the scheduler must poll
-    // immediately. `--hidden` still fires `activate` (starting the scheduler)
-    // without showing a window.
-    let hidden = std::env::args().any(|arg| arg == "--hidden");
+    // `--hidden`: the background process, started at login by the autostart
+    // entry. It runs the scheduler and the alarm notifications and never
+    // creates a window, so it never loads the graphics driver. Anything else
+    // is the UI process.
+    if std::env::args().any(|arg| arg == "--hidden") {
+        run_background()
+    } else {
+        run_ui()
+    }
+}
 
+fn run_background() -> glib::ExitCode {
+    // Plain GApplication: no GTK, no display connection.
+    let app = gio::Application::builder().application_id(APP_ID).build();
+    let started = Rc::new(Cell::new(false));
+    app.connect_activate(move |app| {
+        // A second launch is forwarded here over D-Bus; only the first
+        // builds anything or takes the hold.
+        if started.replace(true) {
+            return;
+        }
+        // Keeps the app alive with no window; releases on drop, so it is
+        // forgotten.
+        std::mem::forget(app.hold());
+
+        // A previous run killed mid-alarm can leave automatic brightness off.
+        cajole::auto_brightness::restore_pending();
+
+        build_background(app);
+    });
+
+    // GApplication rejects unknown options, so it gets only `argv[0]`.
+    let args: Vec<String> = std::env::args().take(1).collect();
+    app.run_with_args(&args)
+}
+
+fn update_silent_banner(main_ui: &SharedMainUi, path: &std::path::Path) {
+    if let Some(ui) = main_ui.borrow().as_ref() {
+        ui.silent_banner.set_revealed(silent_banner_needed(path));
+    }
+}
+
+/// Holiday housekeeping that a list refresh also does.
+fn sweep_holidays(path: &std::path::Path) {
+    let settings = cajole::holiday::HolidaySettings::load(holiday_path()).unwrap_or_default();
+    if let Ok(mut store) = AlarmStore::load(path) {
+        if let Err(err) = cajole::holiday::sweep(&mut store, &settings, chrono::Local::now()) {
+            tracing::warn!(%err, "holiday housekeeping failed");
+        }
+    }
+}
+
+/// Builds the scheduler, the alarm notification actions and the wake-timer
+/// hook, none of which need a window.
+fn build_background(app: &gio::Application) {
+    let path = store_path();
+
+    let ringing: RingingMap = Rc::new(RefCell::new(HashMap::new()));
+    // Filled in once the `SchedulerHandle` is built below, so actions defined
+    // before that point can still ask for a reschedule through
+    // `request_reschedule`, which handles the unset case.
+    let scheduler_handle_cell: Rc<RefCell<Option<scheduler::SchedulerHandle>>> =
+        Rc::new(RefCell::new(None));
+    let tracker: SharedTracker = Rc::new(RefCell::new(TriggerTracker::new()));
+
+    // After anything the open UI should show: holiday housekeeping, then a
+    // reload request to the UI process, if one is running.
+    let after_change: RefreshFn = {
+        let path = path.clone();
+        Rc::new(move || {
+            sweep_holidays(&path);
+            activate_remote_action(UI_APP_ID, "refresh", None);
+        })
+    };
+
+    // These two are the alarm's controls, registered on the application so
+    // they work from a notification's action buttons, including on the lock
+    // screen with no window open (see `SchedulerEvent::Ringing` below, where
+    // the notification is sent). Both call [`handle_alarm_dismissed`] and
+    // [`handle_alarm_snoozed`], which the in-app ring dialog also calls.
+    let dismiss_alarm_action = gio::SimpleAction::new("dismiss-alarm", Some(glib::VariantTy::STRING));
+    dismiss_alarm_action.connect_activate({
+        let app = app.clone();
+        let path = path.clone();
+        let ringing = ringing.clone();
+        let after_change = after_change.clone();
+        let scheduler_handle_cell = scheduler_handle_cell.clone();
+        move |_, parameter| {
+            let Some(id_str) = parameter.and_then(|v| v.get::<String>()) else {
+                return;
+            };
+            let Ok(alarm_id) = Uuid::parse_str(&id_str) else {
+                return;
+            };
+            let app = app.clone();
+            let path = path.clone();
+            let ringing = ringing.clone();
+                let after_change = after_change.clone();
+            let scheduler_handle = scheduler_handle_cell.borrow().clone();
+            glib::MainContext::default().spawn_local(async move {
+                handle_alarm_dismissed(
+                    &app,
+                    &path,
+                    &ringing,
+                    &after_change,
+                    scheduler_handle,
+                    alarm_id,
+                )
+                .await;
+            });
+        }
+    });
+    app.add_action(&dismiss_alarm_action);
+
+    let snooze_alarm_action = gio::SimpleAction::new("snooze-alarm", Some(glib::VariantTy::STRING));
+    snooze_alarm_action.connect_activate({
+        let app = app.clone();
+        let path = path.clone();
+        let ringing = ringing.clone();
+        let tracker = tracker.clone();
+        let after_change = after_change.clone();
+        let scheduler_handle_cell = scheduler_handle_cell.clone();
+        move |_, parameter| {
+            let Some(id_str) = parameter.and_then(|v| v.get::<String>()) else {
+                return;
+            };
+            let Ok(alarm_id) = Uuid::parse_str(&id_str) else {
+                return;
+            };
+            let app = app.clone();
+            let path = path.clone();
+            let ringing = ringing.clone();
+            let tracker = tracker.clone();
+                let after_change = after_change.clone();
+            let scheduler_handle = scheduler_handle_cell.borrow().clone();
+            glib::MainContext::default().spawn_local(async move {
+                handle_alarm_snoozed(
+                    &app,
+                    &path,
+                    &ringing,
+                    &tracker,
+                    &after_change,
+                    scheduler_handle,
+                    alarm_id,
+                )
+                .await;
+            });
+        }
+    });
+    app.add_action(&snooze_alarm_action);
+
+    // Dismissing an alarm before it rings differs from dismissing a ringing
+    // one: there is no `RingSession` to stop and no ring dialog to close. A
+    // one-time alarm is turned off, as after it rings; a repeating alarm skips
+    // today's occurrence through `Alarm::skip_through` (a date, because a
+    // stored target time reverted time edits for that occurrence; see that
+    // field).
+    let dismiss_early_action =
+        gio::SimpleAction::new("dismiss-alarm-early", Some(glib::VariantTy::STRING));
+    dismiss_early_action.connect_activate({
+        let app = app.clone();
+        let path = path.clone();
+        let tracker = tracker.clone();
+        let after_change = after_change.clone();
+        let scheduler_handle_cell = scheduler_handle_cell.clone();
+        move |_, parameter| {
+            let Some(id_str) = parameter.and_then(|v| v.get::<String>()) else {
+                return;
+            };
+            let Ok(alarm_id) = Uuid::parse_str(&id_str) else {
+                return;
+            };
+            let app = app.clone();
+            let path = path.clone();
+            let tracker = tracker.clone();
+            let after_change = after_change.clone();
+            let scheduler_handle_cell = scheduler_handle_cell.clone();
+            glib::MainContext::default().spawn_local(async move {
+                app.withdraw_notification(&format!("upcoming-{alarm_id}"));
+                if let Ok(mut store) = AlarmStore::load(&path) {
+                    if let Some(alarm) = store.get(alarm_id) {
+                        let mut updated = alarm.clone();
+                        if updated.repeat.is_empty() {
+                            updated.enabled = false;
+                        } else {
+                            updated.skip_through = Some(chrono::Local::now().date_naive());
+                        }
+                        if let Err(err) = store.upsert(updated) {
+                            tracing::warn!(%err, "failed to dismiss alarm early");
+                        }
+                        // Without this, the poll loop's cached next trigger
+                        // stays at the skipped time until something
+                        // invalidates it, since `sync` computes a value only
+                        // for alarms it is not tracking. Same as
+                        // `scheduler::snooze`'s `forget` call.
+                        tracker.borrow_mut().forget(alarm_id);
+                    }
+                }
+                request_reschedule(&scheduler_handle_cell);
+                after_change();
+            });
+        }
+    });
+    app.add_action(&dismiss_early_action);
+
+
+    // Starts the scheduler: one check immediately, then an infrequent fallback
+    // poll. The primary wake mechanism is a `systemd --user` timer rescheduled
+    // whenever the next needed time could change (see
+    // `scheduler::SchedulerHandle`). No second thread or channel.
+    //
+    // Verifying and rescheduling the wake timer at startup is alarm
+    // correctness, so it is first in line for the main loop.
+    let scheduler_handle = {
+        let app = app.clone();
+        let after_change = after_change.clone();
+        scheduler::SchedulerHandle::new(path.clone(), ringing.clone(), tracker.clone(), move |event| {
+            let on_ringing_app = &app;
+            let on_ringing_after_change = &after_change;
+            match event {
+                scheduler::SchedulerEvent::Ringing { alarm_id, label } => {
+                    // Clears a still-showing "upcoming" prompt for this alarm
+                    // immediately instead of waiting for the next poll, which
+                    // would also clear it. Withdrawing an already-gone
+                    // notification is a no-op.
+                    on_ringing_app.withdraw_notification(&format!("upcoming-{alarm_id}"));
+
+                    // This is the alarm's always-working UI: notification
+                    // actions run as app-level GActions with no window, so
+                    // they work from the lock screen, as GNOME Clocks rings on
+                    // Phosh. The `.desktop` file under `data/` must be
+                    // installed (see `data/README.md`), or GNOME Shell silently
+                    // drops the notification.
+                    let title = if label.trim().is_empty() { "Alarm" } else { &label };
+                    let notification = gio::Notification::new(title);
+                    notification.set_body(Some("Ringing — snooze or dismiss below."));
+                    notification.set_priority(gio::NotificationPriority::Urgent);
+                    // Tapping the notification body opens the app. Forcing
+                    // focus without user interaction is blocked by Wayland's
+                    // focus-stealing prevention.
+                    notification.set_default_action("app.open");
+                    let id_variant = alarm_id.to_string().to_variant();
+                    notification.add_button_with_target_value(
+                        "Snooze",
+                        "app.snooze-alarm",
+                        Some(&id_variant),
+                    );
+                    notification.add_button_with_target_value(
+                        "Dismiss",
+                        "app.dismiss-alarm",
+                        Some(&id_variant),
+                    );
+                    on_ringing_app.send_notification(Some(&alarm_id.to_string()), &notification);
+
+                    // The ring screen lives in the UI process, so the GL driver is
+                    // never loaded here. A locked phone relies on the notification.
+                    launch_ui(Some(alarm_id));
+                }
+                scheduler::SchedulerEvent::AutoStopped { alarm_id } => {
+                    on_ringing_app.withdraw_notification(&alarm_id.to_string());
+                    activate_remote_action(UI_APP_ID, "close-ring", Some(alarm_id.to_string().to_variant()));
+                    on_ringing_after_change();
+                }
+                scheduler::SchedulerEvent::UpcomingAlarmCleared { alarm_id } => {
+                    on_ringing_app.withdraw_notification(&format!("upcoming-{alarm_id}"));
+                }
+                scheduler::SchedulerEvent::UpcomingAlarm { alarm_id, label, next_trigger } => {
+                    let title = if label.trim().is_empty() { "Upcoming Alarm".to_string() } else { label };
+                    // An absolute time, not "X minutes from now", which goes
+                    // stale while the notification sits unread. AOSP's
+                    // DeskClock uses the formatted time for the same reason.
+                    let use_12h = system_uses_12h_clock();
+                    let when = next_trigger
+                        .format(if use_12h { "%l:%M %p" } else { "%H:%M" })
+                        .to_string();
+                    let when = when.trim_start();
+                    let notification = gio::Notification::new(&title);
+                    notification.set_body(Some(&format!("Scheduled for {when}.")));
+                    notification.set_priority(gio::NotificationPriority::Normal);
+                    let id_variant = alarm_id.to_string().to_variant();
+                    notification.add_button_with_target_value(
+                        "Dismiss Early",
+                        "app.dismiss-alarm-early",
+                        Some(&id_variant),
+                    );
+                    // A different notification id from the "ringing" one this
+                    // alarm will get later: this one can be ignored and left
+                    // to expire, the ringing one cannot, and a shared id could
+                    // let one replace the other.
+                    on_ringing_app.send_notification(
+                        Some(&format!("upcoming-{alarm_id}")),
+                        &notification,
+                    );
+                }
+            }
+        })
+    };
+    *scheduler_handle_cell.borrow_mut() = Some(scheduler_handle.clone());
+
+    // Registered on the app, not tied to a window: the systemd wake timer's
+    // command pokes it (`gdbus call ... org.gtk.Actions.Activate
+    // check-schedule`), and anything else can force a recheck. Takes no
+    // parameters; the check reads the alarm store fresh.
+    let check_schedule_action = gio::SimpleAction::new("check-schedule", None);
+    check_schedule_action.connect_activate({
+        let scheduler_handle = scheduler_handle.clone();
+        move |_, _| {
+            let scheduler_handle = scheduler_handle.clone();
+            glib::MainContext::default().spawn_local(async move {
+                scheduler::check_and_reschedule(&scheduler_handle).await;
+            });
+        }
+    });
+    app.add_action(&check_schedule_action);
+
+    glib::MainContext::default().spawn_local({
+        let scheduler_handle = scheduler_handle.clone();
+        async move {
+            scheduler::run(scheduler_handle).await;
+        }
+    });
+
+
+    // The UI edited an alarm: its cached next trigger is stale.
+    let alarm_changed_action = gio::SimpleAction::new("alarm-changed", Some(glib::VariantTy::STRING));
+    alarm_changed_action.connect_activate({
+        let tracker = tracker.clone();
+        let scheduler_handle_cell = scheduler_handle_cell.clone();
+        move |_, parameter| {
+            let Some(alarm_id) = parameter
+                .and_then(|v| v.get::<String>())
+                .and_then(|s| Uuid::parse_str(&s).ok())
+            else {
+                return;
+            };
+            tracker.borrow_mut().forget(alarm_id);
+            request_reschedule(&scheduler_handle_cell);
+        }
+    });
+    app.add_action(&alarm_changed_action);
+
+    // A just-started ring screen missed any "close-ring" sent before it was
+    // up, so it asks whether the alarm is still ringing.
+    let ring_ui_ready_action = gio::SimpleAction::new("ring-ui-ready", Some(glib::VariantTy::STRING));
+    ring_ui_ready_action.connect_activate({
+        let ringing = ringing.clone();
+        move |_, parameter| {
+            let Some(alarm_id) = parameter
+                .and_then(|v| v.get::<String>())
+                .and_then(|s| Uuid::parse_str(&s).ok())
+            else {
+                return;
+            };
+            if !ringing.borrow().contains_key(&alarm_id) {
+                activate_remote_action(UI_APP_ID, "close-ring", Some(alarm_id.to_string().to_variant()));
+            }
+        }
+    });
+    app.add_action(&ring_ui_ready_action);
+
+    // Tapping a notification's body opens the app. Activating the action runs
+    // in this process, which starts the UI process.
+    let open_action = gio::SimpleAction::new("open", None);
+    open_action.connect_activate(|_, _| launch_ui(None));
+    app.add_action(&open_action);
+}
+
+/// Handles an alarm being dismissed, from the ring screen's Dismiss button or
+/// a notification's Dismiss action.
+async fn handle_alarm_dismissed(
+    app: &gio::Application,
+    store_path: &std::path::Path,
+    ringing: &RingingMap,
+    after_change: &RefreshFn,
+    scheduler_handle: Option<scheduler::SchedulerHandle>,
+    alarm_id: Uuid,
+) {
+    app.withdraw_notification(&alarm_id.to_string());
+    scheduler::dismiss(store_path, ringing, alarm_id).await;
+    if let Some(handle) = scheduler_handle {
+        scheduler::check_and_reschedule(&handle).await;
+    }
+    activate_remote_action(UI_APP_ID, "close-ring", Some(alarm_id.to_string().to_variant()));
+    after_change();
+}
+
+/// Handles an alarm being snoozed, from the ring screen's Snooze button or a
+/// notification's Snooze action.
+async fn handle_alarm_snoozed(
+    app: &gio::Application,
+    store_path: &std::path::Path,
+    ringing: &RingingMap,
+    tracker: &SharedTracker,
+    after_change: &RefreshFn,
+    scheduler_handle: Option<scheduler::SchedulerHandle>,
+    alarm_id: Uuid,
+) {
+    app.withdraw_notification(&alarm_id.to_string());
+    scheduler::snooze(store_path, ringing, tracker, alarm_id).await;
+    if let Some(handle) = scheduler_handle {
+        scheduler::check_and_reschedule(&handle).await;
+    }
+    activate_remote_action(UI_APP_ID, "close-ring", Some(alarm_id.to_string().to_variant()));
+    after_change();
+}
+
+/// What exists only while the main window is open. The window is destroyed on
+/// close so its widgets are freed.
+struct MainUi {
+    window: adw::ApplicationWindow,
+    refresh: RefreshFn,
+    silent_banner: adw::Banner,
+    list_box: gtk4::ListBox,
+    holiday_list_box: gtk4::ListBox,
+}
+
+type SharedMainUi = Rc<RefCell<Option<MainUi>>>;
+
+/// State the UI process keeps for its whole life. Nothing here holds a widget
+/// of the main window.
+#[derive(Clone)]
+struct Ui {
+    path: PathBuf,
+    vibration_available: Rc<Cell<bool>>,
+    brightness_available: Rc<Cell<bool>>,
+    main_ui: SharedMainUi,
+    ring_dialogs: RingDialogs,
+    refresh_list: RefreshFn,
+}
+
+const WINDOW_ACTIONS: [&str; 4] = ["manage-sounds", "holiday-mode", "settings", "about"];
+
+/// Returns the freed heap to the OS once the window's widgets are gone.
+fn release_freed_memory() {
+    #[cfg(target_env = "gnu")]
+    glib::timeout_add_seconds_local_once(1, || {
+        // SAFETY: takes no pointers; only returns free heap pages to the OS.
+        unsafe { libc::malloc_trim(0) };
+    });
+}
+
+/// Starts the background process if none is running, so opening the app
+/// still starts alarms.
+fn ensure_background_running() {
+    glib::MainContext::default().spawn_local(async {
+        let Ok(conn) = gio::bus_get_future(gio::BusType::Session).await else {
+            return;
+        };
+        let reply = conn
+            .call_future(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameHasOwner",
+                Some(&(APP_ID,).to_variant()),
+                None,
+                gio::DBusCallFlags::NONE,
+                -1,
+            )
+            .await;
+        let running = reply
+            .ok()
+            .and_then(|v| v.child_value(0).get::<bool>())
+            .unwrap_or(false);
+        if !running {
+            spawn_self(&["--hidden"]);
+        }
+    });
+}
+
+fn run_ui() -> glib::ExitCode {
     // Registers the bundled bytes (compiled by build.rs) under their resource
     // paths. Display-independent, so it runs here, unlike `add_resource_path`
-    // below, which needs a Display and waits for the first `activate`. Icons
-    // cannot be looked up until that second step.
+    // below, which needs a Display and waits for the first command line.
     let resource_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/cajole.gresource"));
     let resource = gio::Resource::from_data(&glib::Bytes::from_static(resource_bytes))
         .expect("failed to load bundled cajole.gresource — build.rs should have compiled this");
@@ -198,86 +746,190 @@ fn main() -> glib::ExitCode {
     // the binary name. Phosh logs "Could not find application for app-id
     // 'cajole'" otherwise.
     glib::set_prgname(Some(APP_ID));
-    let app = adw::Application::builder().application_id(APP_ID).build();
 
-    // `hidden` suppresses window presentation only on this process's first
-    // activation (gated on `first_activation`). Every later activation,
-    // forwarded over D-Bus when someone opens the app, is a request to see the
-    // UI and always gets a window.
-    //
-    // `started` is a separate flag instead of checking for a window: in the
-    // first-activation, hidden case no window exists either, for a different
-    // reason.
-    let started: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    app.connect_activate(move |app| {
-        // `activate` can fire more than once: later launch attempts are
-        // forwarded here over D-Bus (GApplication's single-instance behavior).
-        // Only the first activation builds anything or takes the hold.
-        let first_activation = !started.get();
-        if first_activation {
-            started.set(true);
+    // A separate application ID from the background process, which owns
+    // `APP_ID` on the bus. The window still gets `APP_ID` through the program
+    // name above.
+    let app = adw::Application::builder()
+        .application_id(UI_APP_ID)
+        .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
+        .build();
 
-            // Teaches this display's icon theme to resolve names under the
-            // bundled badge icons' resource path. Needs a Display, so it waits
-            // for the first activation and is gated by `first_activation` like
-            // the rest.
-            if let Some(display) = gtk4::gdk::Display::default() {
-                gtk4::IconTheme::for_display(&display)
-                    .add_resource_path("/net/dunevent/Cajole/icons");
-            }
+    let ui: Rc<RefCell<Option<Ui>>> = Rc::new(RefCell::new(None));
+    app.connect_command_line(move |app, command_line| {
+        // Every launch ends up here, including later ones forwarded from
+        // another process: `--ring <id>` for a ringing alarm, nothing for a
+        // plain open.
+        let args = command_line.arguments();
+        let ring = args
+            .iter()
+            .position(|arg| arg == "--ring")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|arg| arg.to_str())
+            .and_then(|arg| Uuid::parse_str(arg).ok());
 
-            // Keeps the app alive for the process lifetime. Without it,
-            // GApplication quits when the last window closes, which would stop
-            // the scheduler and every alarm. `hold()` returns a guard that
-            // releases on drop; `forget` keeps it held.
-            //
-            // Called here in `activate`, gated by a `started` flag, not
-            // unconditionally before `run()`: the earlier placement was meant
-            // to avoid a race between `hold()` and GApplication's exit check
-            // against a zero use-count. This placement is the pattern the
-            // sibling project Ripples ships.
-            std::mem::forget(app.hold());
-
-            // A previous run killed mid-alarm can leave automatic brightness off.
-            cajole::auto_brightness::restore_pending();
-
-            build_ui(app, hidden);
+        if ui.borrow().is_none() {
+            *ui.borrow_mut() = Some(build_ui_core(app));
+            ensure_background_running();
         }
+        let Some(ui) = ui.borrow().clone() else {
+            return 1;
+        };
 
-        // Every activation except the first-and-hidden one shows the window.
-        // `app.active_window()` is used instead of a separate
-        // `Option<Window>`, since GTK tracks windows built with
-        // `.application(app)`.
-        if !(first_activation && hidden) {
-            if let Some(window) = app.active_window() {
-                window.present();
+        match ring {
+            Some(alarm_id) => show_ring(app, &ui, alarm_id),
+            None => open_main_window(app, &ui),
+        }
+        0
+    });
+
+    // The UI process has no hold: it exits when its last window closes.
+    app.run()
+}
+
+/// Presents the main window, building it if it was closed.
+fn open_main_window(app: &adw::Application, ui: &Ui) {
+    let has_window = ui.main_ui.borrow().is_some();
+    if has_window {
+        // `app.active_window()` is used instead of tracking the window, so an
+        // open dialog is the one brought forward.
+        if let Some(window) = app.active_window() {
+            window.present();
+        }
+    } else {
+        build_main_window(app, ui).present();
+    }
+}
+
+fn show_ring(app: &adw::Application, ui: &Ui, alarm_id: Uuid) {
+    if ui.ring_dialogs.borrow().contains_key(&alarm_id) {
+        return;
+    }
+    let label = AlarmStore::load(&ui.path)
+        .ok()
+        .and_then(|store| store.get(alarm_id).map(|alarm| alarm.label.clone()))
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or_else(|| "Alarm".to_string());
+    let parent = ui.main_ui.borrow().as_ref().map(|main| main.window.clone());
+    show_ring_dialog(app, parent.as_ref(), alarm_id, &label, Backend, ui.ring_dialogs.clone());
+    Backend.ring_ui_ready(alarm_id);
+}
+
+/// Sets up what the UI process needs before any window: the actions the
+/// background process calls, the capability probe and the Silent banner
+/// subscription.
+fn build_ui_core(app: &adw::Application) -> Ui {
+    install_time_picker_css();
+    if let Some(display) = gtk4::gdk::Display::default() {
+        gtk4::IconTheme::for_display(&display).add_resource_path("/net/dunevent/Cajole/icons");
+    }
+    let path = store_path();
+
+    // Probed once, since both are properties of the session and hardware.
+    // Defaults to `true` until the check completes: briefly showing a control
+    // that does nothing is a smaller problem than hiding a working one, and
+    // existing vibration or glow settings should not vanish while the check
+    // runs.
+    let vibration_available: Rc<Cell<bool>> = Rc::new(Cell::new(true));
+    let brightness_available: Rc<Cell<bool>> = Rc::new(Cell::new(true));
+    glib::MainContext::default().spawn_local({
+        let vibration_available = vibration_available.clone();
+        let brightness_available = brightness_available.clone();
+        async move {
+            if let Ok(conn) = gio::bus_get_future(gio::BusType::Session).await {
+                vibration_available.set(cajole::feedback::vibration_available(&conn).await);
+                brightness_available.set(cajole::display::brightness_available(&conn).await);
             }
         }
     });
 
-    // Filtered from argv instead of built from scratch: GApplication needs a
-    // normal-looking argument list (at least `argv[0]`) for D-Bus registration
-    // and single-instance forwarding. An empty array avoided the "Unknown
-    // option --hidden" rejection but fed GLib an unusual lifecycle; stripping
-    // the one unrecognized flag keeps the rest intact.
-    let filtered_args: Vec<String> = std::env::args().filter(|arg| arg != "--hidden").collect();
-    app.run_with_args(&filtered_args)
+    let main_ui: SharedMainUi = Rc::new(RefCell::new(None));
+    let ring_dialogs: RingDialogs = Rc::new(RefCell::new(HashMap::new()));
+    let refresh_list: RefreshFn = {
+        let main_ui = main_ui.clone();
+        Rc::new(move || {
+            let refresh = main_ui.borrow().as_ref().map(|ui| ui.refresh.clone());
+            if let Some(refresh) = refresh {
+                refresh();
+            }
+        })
+    };
+
+    // Called by the background process when alarms changed under the UI.
+    let refresh_action = gio::SimpleAction::new("refresh", None);
+    refresh_action.connect_activate({
+        let refresh_list = refresh_list.clone();
+        move |_, _| refresh_list()
+    });
+    app.add_action(&refresh_action);
+
+    // Called by the background process when an alarm stopped ringing without
+    // this UI's buttons: dismissed from the notification, or ran out.
+    let close_ring_action = gio::SimpleAction::new("close-ring", Some(glib::VariantTy::STRING));
+    close_ring_action.connect_activate({
+        let ring_dialogs = ring_dialogs.clone();
+        move |_, parameter| {
+            let Some(alarm_id) = parameter
+                .and_then(|v| v.get::<String>())
+                .and_then(|s| Uuid::parse_str(&s).ok())
+            else {
+                return;
+            };
+            if let Some(dialog) = ring_dialogs.borrow_mut().remove(&alarm_id) {
+                dialog.close();
+            }
+        }
+    });
+    app.add_action(&close_ring_action);
+
+    // Settings changes and feedbackd profile changes re-evaluate the
+    // Silent banner without a full list refresh.
+    let update_silent_banner_action = gio::SimpleAction::new("update-silent-banner", None);
+    update_silent_banner_action.connect_activate({
+        let main_ui = main_ui.clone();
+        let path = path.clone();
+        move |_, _| update_silent_banner(&main_ui, &path)
+    });
+    app.add_action(&update_silent_banner_action);
+    glib::MainContext::default().spawn_local({
+        let main_ui = main_ui.clone();
+        let path = path.clone();
+        async move {
+            let Ok(conn) = gio::bus_get_future(gio::BusType::Session).await else {
+                return;
+            };
+            // Subscribed for the app's lifetime.
+            let _subscription = conn.signal_subscribe(
+                Some("org.sigxcpu.Feedback"),
+                Some("org.freedesktop.DBus.Properties"),
+                Some("PropertiesChanged"),
+                Some("/org/sigxcpu/Feedback"),
+                None,
+                gio::DBusSignalFlags::NONE,
+                move |_, _, _, _, _, _| update_silent_banner(&main_ui, &path),
+            );
+        }
+    });
+
+    Ui {
+        path,
+        vibration_available,
+        brightness_available,
+        main_ui,
+        ring_dialogs,
+        refresh_list,
+    }
 }
 
-fn build_ui(app: &adw::Application, hidden: bool) -> adw::ApplicationWindow {
-    install_time_picker_css();
-    let path = store_path();
+/// Builds the main window and registers it in `ui.main_ui`. The window is
+/// destroyed on close; the next open builds a new one.
+fn build_main_window(app: &adw::Application, ui: &Ui) -> adw::ApplicationWindow {
+    let path = ui.path.clone();
+    let backend = Backend;
+    let vibration_available = ui.vibration_available.clone();
+    let brightness_available = ui.brightness_available.clone();
+    let refresh_list = ui.refresh_list.clone();
 
-    let ringing: RingingMap = Rc::new(RefCell::new(HashMap::new()));
-    // Filled in once the `SchedulerHandle` is built below. It needs
-    // `refresh_list`, and `refresh_list` must be usable by things defined
-    // before that point; this cell breaks the cycle, as `RefreshCell` does for
-    // the Sound Manager. Callers go through `request_reschedule`, which
-    // handles the unset case.
-    let scheduler_handle_cell: Rc<RefCell<Option<scheduler::SchedulerHandle>>> =
-        Rc::new(RefCell::new(None));
-    let tracker: SharedTracker = Rc::new(RefCell::new(TriggerTracker::new()));
-    let open_ring_dialogs: RingDialogs = Rc::new(RefCell::new(HashMap::new()));
 
     let list_box = gtk4::ListBox::builder()
         .valign(gtk4::Align::Start)
@@ -415,14 +1067,6 @@ fn build_ui(app: &adw::Application, hidden: bool) -> adw::ApplicationWindow {
         .content(&toolbar_view)
         .build();
 
-    // Closing the window hides it: Cajole must keep running in the background.
-    // Returning `Stop` skips GTK's default close (which destroys the window);
-    // the `hold()` in `main` keeps the app alive, and a later `activate` calls
-    // `.present()` on this window.
-    window.connect_close_request(|window| {
-        window.set_visible(false);
-        glib::Propagation::Stop
-    });
 
     let manage_sounds_action = gio::SimpleAction::new("manage-sounds", None);
     manage_sounds_action.connect_activate({
@@ -455,15 +1099,7 @@ fn build_ui(app: &adw::Application, hidden: bool) -> adw::ApplicationWindow {
     });
     app.add_action(&about_action);
 
-    // Probed once at startup, since both are properties of the session and
-    // hardware. Defaults to `true` until the check completes: briefly showing
-    // a control that does nothing is a smaller problem than hiding a working
-    // one, and existing vibration or glow settings should not vanish while the
-    // check runs.
-    let vibration_available: Rc<Cell<bool>> = Rc::new(Cell::new(true));
-    let brightness_available: Rc<Cell<bool>> = Rc::new(Cell::new(true));
-
-    let refresh_list: RefreshFn = {
+    let refresh_real: RefreshFn = {
         let list_box = list_box.clone();
         let holiday_list_box = holiday_list_box.clone();
         let holiday_group = holiday_group.clone();
@@ -473,11 +1109,11 @@ fn build_ui(app: &adw::Application, hidden: bool) -> adw::ApplicationWindow {
         let toast_overlay = toast_overlay.clone();
         let vibration_available = vibration_available.clone();
         let brightness_available = brightness_available.clone();
-        let tracker = tracker.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
+        let backend = backend.clone();
         let holiday_banner = holiday_banner.clone();
         let upcoming_holiday_banner = upcoming_holiday_banner.clone();
         let silent_banner = silent_banner.clone();
+        let refresh_list = refresh_list.clone();
         Rc::new(move || {
             refresh_list_impl(
                 &list_box,
@@ -489,8 +1125,8 @@ fn build_ui(app: &adw::Application, hidden: bool) -> adw::ApplicationWindow {
                 &toast_overlay,
                 &vibration_available,
                 &brightness_available,
-                &tracker,
-                &scheduler_handle_cell,
+                &backend,
+                &refresh_list,
             );
             let settings = cajole::holiday::HolidaySettings::load(holiday_path()).unwrap_or_default();
             let now = chrono::Local::now();
@@ -509,36 +1145,7 @@ fn build_ui(app: &adw::Application, hidden: bool) -> adw::ApplicationWindow {
             silent_banner.set_revealed(silent_banner_needed(&path));
         })
     };
-    refresh_list();
-
-    // Settings changes and feedbackd profile changes re-evaluate the
-    // Silent banner without a full list refresh.
-    let update_silent_banner_action = gio::SimpleAction::new("update-silent-banner", None);
-    update_silent_banner_action.connect_activate({
-        let silent_banner = silent_banner.clone();
-        let path = path.clone();
-        move |_, _| silent_banner.set_revealed(silent_banner_needed(&path))
-    });
-    app.add_action(&update_silent_banner_action);
-    glib::MainContext::default().spawn_local({
-        let silent_banner = silent_banner.clone();
-        let path = path.clone();
-        async move {
-            let Ok(conn) = gio::bus_get_future(gio::BusType::Session).await else {
-                return;
-            };
-            // Subscribed for the app's lifetime.
-            let _subscription = conn.signal_subscribe(
-                Some("org.sigxcpu.Feedback"),
-                Some("org.freedesktop.DBus.Properties"),
-                Some("PropertiesChanged"),
-                Some("/org/sigxcpu/Feedback"),
-                None,
-                gio::DBusSignalFlags::NONE,
-                move |_, _, _, _, _, _| silent_banner.set_revealed(silent_banner_needed(&path)),
-            );
-        }
-    });
+    refresh_real();
 
     let holiday_mode_action = gio::SimpleAction::new("holiday-mode", None);
     holiday_mode_action.connect_activate({
@@ -548,8 +1155,7 @@ fn build_ui(app: &adw::Application, hidden: bool) -> adw::ApplicationWindow {
         let toast_overlay = toast_overlay.clone();
         let vibration_available = vibration_available.clone();
         let brightness_available = brightness_available.clone();
-        let tracker = tracker.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
+        let backend = backend.clone();
         move |_, _| {
             show_holiday_wizard(
                 &window,
@@ -558,159 +1164,24 @@ fn build_ui(app: &adw::Application, hidden: bool) -> adw::ApplicationWindow {
                 toast_overlay.clone(),
                 vibration_available.clone(),
                 brightness_available.clone(),
-                tracker.clone(),
-                scheduler_handle_cell.clone(),
+                backend.clone(),
             );
         }
     });
     app.add_action(&holiday_mode_action);
 
-    // These two are the alarm's controls, registered on the application so
-    // they work from a notification's action buttons, including on the lock
-    // screen with no window open (see `SchedulerEvent::Ringing` below, where
-    // the notification is sent). Both call [`handle_alarm_dismissed`] and
-    // [`handle_alarm_snoozed`], which the in-app ring dialog also calls.
-    let dismiss_alarm_action = gio::SimpleAction::new("dismiss-alarm", Some(glib::VariantTy::STRING));
-    dismiss_alarm_action.connect_activate({
-        let app = app.clone();
-        let path = path.clone();
-        let ringing = ringing.clone();
-        let open_ring_dialogs = open_ring_dialogs.clone();
-        let refresh_list = refresh_list.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
-        move |_, parameter| {
-            let Some(id_str) = parameter.and_then(|v| v.get::<String>()) else {
-                return;
-            };
-            let Ok(alarm_id) = Uuid::parse_str(&id_str) else {
-                return;
-            };
-            let app = app.clone();
-            let path = path.clone();
-            let ringing = ringing.clone();
-            let open_ring_dialogs = open_ring_dialogs.clone();
-            let refresh_list = refresh_list.clone();
-            let scheduler_handle = scheduler_handle_cell.borrow().clone();
-            glib::MainContext::default().spawn_local(async move {
-                handle_alarm_dismissed(
-                    &app,
-                    &path,
-                    &ringing,
-                    &open_ring_dialogs,
-                    &refresh_list,
-                    scheduler_handle,
-                    alarm_id,
-                )
-                .await;
-            });
-        }
-    });
-    app.add_action(&dismiss_alarm_action);
-
-    let snooze_alarm_action = gio::SimpleAction::new("snooze-alarm", Some(glib::VariantTy::STRING));
-    snooze_alarm_action.connect_activate({
-        let app = app.clone();
-        let path = path.clone();
-        let ringing = ringing.clone();
-        let tracker = tracker.clone();
-        let open_ring_dialogs = open_ring_dialogs.clone();
-        let refresh_list = refresh_list.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
-        move |_, parameter| {
-            let Some(id_str) = parameter.and_then(|v| v.get::<String>()) else {
-                return;
-            };
-            let Ok(alarm_id) = Uuid::parse_str(&id_str) else {
-                return;
-            };
-            let app = app.clone();
-            let path = path.clone();
-            let ringing = ringing.clone();
-            let tracker = tracker.clone();
-            let open_ring_dialogs = open_ring_dialogs.clone();
-            let refresh_list = refresh_list.clone();
-            let scheduler_handle = scheduler_handle_cell.borrow().clone();
-            glib::MainContext::default().spawn_local(async move {
-                handle_alarm_snoozed(
-                    &app,
-                    &path,
-                    &ringing,
-                    &tracker,
-                    &open_ring_dialogs,
-                    &refresh_list,
-                    scheduler_handle,
-                    alarm_id,
-                )
-                .await;
-            });
-        }
-    });
-    app.add_action(&snooze_alarm_action);
-
-    // Dismissing an alarm before it rings differs from dismissing a ringing
-    // one: there is no `RingSession` to stop and no ring dialog to close. A
-    // one-time alarm is turned off, as after it rings; a repeating alarm skips
-    // today's occurrence through `Alarm::skip_through` (a date, because a
-    // stored target time reverted time edits for that occurrence; see that
-    // field).
-    let dismiss_early_action =
-        gio::SimpleAction::new("dismiss-alarm-early", Some(glib::VariantTy::STRING));
-    dismiss_early_action.connect_activate({
-        let app = app.clone();
-        let path = path.clone();
-        let tracker = tracker.clone();
-        let refresh_list = refresh_list.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
-        move |_, parameter| {
-            let Some(id_str) = parameter.and_then(|v| v.get::<String>()) else {
-                return;
-            };
-            let Ok(alarm_id) = Uuid::parse_str(&id_str) else {
-                return;
-            };
-            let app = app.clone();
-            let path = path.clone();
-            let tracker = tracker.clone();
-            let refresh_list = refresh_list.clone();
-            let scheduler_handle_cell = scheduler_handle_cell.clone();
-            glib::MainContext::default().spawn_local(async move {
-                app.withdraw_notification(&format!("upcoming-{alarm_id}"));
-                if let Ok(mut store) = AlarmStore::load(&path) {
-                    if let Some(alarm) = store.get(alarm_id) {
-                        let mut updated = alarm.clone();
-                        if updated.repeat.is_empty() {
-                            updated.enabled = false;
-                        } else {
-                            updated.skip_through = Some(chrono::Local::now().date_naive());
-                        }
-                        if let Err(err) = store.upsert(updated) {
-                            tracing::warn!(%err, "failed to dismiss alarm early");
-                        }
-                        // Without this, the poll loop's cached next trigger
-                        // stays at the skipped time until something
-                        // invalidates it, since `sync` computes a value only
-                        // for alarms it is not tracking. Same as
-                        // `scheduler::snooze`'s `forget` call.
-                        tracker.borrow_mut().forget(alarm_id);
-                    }
-                }
-                request_reschedule(&scheduler_handle_cell);
-                refresh_list();
-            });
-        }
-    });
-    app.add_action(&dismiss_early_action);
-
     let open_add_form = {
         let path = path.clone();
         let refresh_list = refresh_list.clone();
-        let window = window.clone();
+        let window = window.downgrade();
         let toast_overlay = toast_overlay.clone();
         let vibration_available = vibration_available.clone();
         let brightness_available = brightness_available.clone();
-        let tracker = tracker.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
+        let backend = backend.clone();
         move || {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
             // No blocking check: "(None)" is always available in the form's
             // sound picker, and that row flags itself (warning triangle,
             // `.warning` style) when selected, instead of gating the form on a
@@ -723,8 +1194,7 @@ fn build_ui(app: &adw::Application, hidden: bool) -> adw::ApplicationWindow {
                 toast_overlay.clone(),
                 vibration_available.clone(),
                 brightness_available.clone(),
-                tracker.clone(),
-                scheduler_handle_cell.clone(),
+                backend.clone(),
                 None,
                 None,
             );
@@ -736,185 +1206,35 @@ fn build_ui(app: &adw::Application, hidden: bool) -> adw::ApplicationWindow {
     });
     empty_add_button.connect_clicked(move |_| open_add_form());
 
-    // Starts the scheduler: one check immediately, then an infrequent fallback
-    // poll. The primary wake mechanism is a `systemd --user` timer rescheduled
-    // whenever the next needed time could change (see
-    // `scheduler::SchedulerHandle`). No second thread or channel.
-    //
-    // Built and spawned right after `refresh_list` (its one prerequisite) and
-    // before everything that is not a dependency of the scheduler: the
-    // capability probe below, `window.present()` and the autostart prompt.
-    // Verifying and rescheduling the wake timer at startup is alarm
-    // correctness and should be first in line for the main loop.
-    let scheduler_handle = {
-        let window = window.clone();
+    *ui.main_ui.borrow_mut() = Some(MainUi {
+        window: window.clone(),
+        refresh: refresh_real,
+        silent_banner: silent_banner.clone(),
+        list_box: list_box.clone(),
+        holiday_list_box: holiday_list_box.clone(),
+    });
+    // Cleanup runs on close, not on `destroy`, which only fires once the last
+    // reference is gone and `main_ui` holds one.
+    window.connect_close_request({
         let app = app.clone();
-        let path = path.clone();
-        let open_ring_dialogs = open_ring_dialogs.clone();
-        let refresh_list = refresh_list.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
-        scheduler::SchedulerHandle::new(path.clone(), ringing.clone(), tracker.clone(), move |event| {
-            let on_ringing_window = &window;
-            let on_ringing_app = &app;
-            let on_ringing_path = &path;
-            let on_ringing_ringing = &ringing;
-            let on_ringing_tracker = &tracker;
-            let on_ringing_dialogs = &open_ring_dialogs;
-            let on_ringing_refresh = &refresh_list;
-            let on_ringing_scheduler_handle_cell = &scheduler_handle_cell;
-            match event {
-                scheduler::SchedulerEvent::Ringing { alarm_id, label } => {
-                    // Clears a still-showing "upcoming" prompt for this alarm
-                    // immediately instead of waiting for the next poll, which
-                    // would also clear it. Withdrawing an already-gone
-                    // notification is a no-op.
-                    on_ringing_app.withdraw_notification(&format!("upcoming-{alarm_id}"));
-
-                    // This is the alarm's always-working UI: notification
-                    // actions run as app-level GActions with no window, so
-                    // they work from the lock screen, as GNOME Clocks rings on
-                    // Phosh. The `.desktop` file under `data/` must be
-                    // installed (see `data/README.md`), or GNOME Shell silently
-                    // drops the notification.
-                    let title = if label.trim().is_empty() { "Alarm" } else { &label };
-                    let notification = gio::Notification::new(title);
-                    notification.set_body(Some("Ringing — snooze or dismiss below."));
-                    notification.set_priority(gio::NotificationPriority::Urgent);
-                    // Tapping the notification body opens the app. Forcing
-                    // focus without user interaction is blocked by Wayland's
-                    // focus-stealing prevention.
-                    notification.set_default_action("app.open");
-                    let id_variant = alarm_id.to_string().to_variant();
-                    notification.add_button_with_target_value(
-                        "Snooze",
-                        "app.snooze-alarm",
-                        Some(&id_variant),
-                    );
-                    notification.add_button_with_target_value(
-                        "Dismiss",
-                        "app.dismiss-alarm",
-                        Some(&id_variant),
-                    );
-                    on_ringing_app.send_notification(Some(&alarm_id.to_string()), &notification);
-
-                    // A convenience for when Cajole is already in the
-                    // foreground; a locked phone relies on the notification.
-                    show_ring_dialog(
-                        &on_ringing_window,
-                        &on_ringing_app,
-                        alarm_id,
-                        &label,
-                        on_ringing_path.clone(),
-                        on_ringing_ringing.clone(),
-                        on_ringing_tracker.clone(),
-                        on_ringing_dialogs.clone(),
-                        on_ringing_refresh.clone(),
-                        on_ringing_scheduler_handle_cell.clone(),
-                    );
-                }
-                scheduler::SchedulerEvent::AutoStopped { alarm_id } => {
-                    on_ringing_app.withdraw_notification(&alarm_id.to_string());
-                    if let Some(dialog) = on_ringing_dialogs.borrow_mut().remove(&alarm_id) {
-                        dialog.close();
+        let main_ui = ui.main_ui.clone();
+        move |_| {
+            for name in WINDOW_ACTIONS {
+                app.remove_action(name);
+            }
+            // Row callbacks hold the list and the window; emptying the lists
+            // breaks the cycle so the window can be freed.
+            if let Some(ui) = main_ui.borrow_mut().take() {
+                for list in [&ui.list_box, &ui.holiday_list_box] {
+                    while let Some(row) = list.row_at_index(0) {
+                        list.remove(&row);
                     }
-                    on_ringing_refresh();
-                }
-                scheduler::SchedulerEvent::UpcomingAlarmCleared { alarm_id } => {
-                    on_ringing_app.withdraw_notification(&format!("upcoming-{alarm_id}"));
-                }
-                scheduler::SchedulerEvent::UpcomingAlarm { alarm_id, label, next_trigger } => {
-                    let title = if label.trim().is_empty() { "Upcoming Alarm".to_string() } else { label };
-                    // An absolute time, not "X minutes from now", which goes
-                    // stale while the notification sits unread. AOSP's
-                    // DeskClock uses the formatted time for the same reason.
-                    let use_12h = system_uses_12h_clock();
-                    let when = next_trigger
-                        .format(if use_12h { "%l:%M %p" } else { "%H:%M" })
-                        .to_string();
-                    let when = when.trim_start();
-                    let notification = gio::Notification::new(&title);
-                    notification.set_body(Some(&format!("Scheduled for {when}.")));
-                    notification.set_priority(gio::NotificationPriority::Normal);
-                    let id_variant = alarm_id.to_string().to_variant();
-                    notification.add_button_with_target_value(
-                        "Dismiss Early",
-                        "app.dismiss-alarm-early",
-                        Some(&id_variant),
-                    );
-                    // A different notification id from the "ringing" one this
-                    // alarm will get later: this one can be ignored and left
-                    // to expire, the ringing one cannot, and a shared id could
-                    // let one replace the other.
-                    on_ringing_app.send_notification(
-                        Some(&format!("upcoming-{alarm_id}")),
-                        &notification,
-                    );
                 }
             }
-        })
-    };
-    *scheduler_handle_cell.borrow_mut() = Some(scheduler_handle.clone());
-
-    // Registered on the app, not tied to a window: the systemd wake timer's
-    // command pokes it (`gdbus call ... org.gtk.Actions.Activate
-    // check-schedule`), and anything else can force a recheck. Takes no
-    // parameters; the check reads the alarm store fresh.
-    let check_schedule_action = gio::SimpleAction::new("check-schedule", None);
-    check_schedule_action.connect_activate({
-        let scheduler_handle = scheduler_handle.clone();
-        move |_, _| {
-            let scheduler_handle = scheduler_handle.clone();
-            glib::MainContext::default().spawn_local(async move {
-                scheduler::check_and_reschedule(&scheduler_handle).await;
-            });
+            release_freed_memory();
+            glib::Propagation::Proceed
         }
     });
-    app.add_action(&check_schedule_action);
-
-    // A GAction so a notification's default action (tapping its body) has
-    // something to activate: `app.activate()` runs the handler a second launch
-    // would trigger, which calls `.present()` on the active window. Tapping a
-    // notification is a compositor-recognized user action; `.present()` from
-    // an internal handler is not, and Wayland's focus-stealing prevention
-    // stops a background process from granting itself focus.
-    let open_action = gio::SimpleAction::new("open", None);
-    open_action.connect_activate({
-        let app = app.clone();
-        move |_, _| {
-            app.activate();
-        }
-    });
-    app.add_action(&open_action);
-
-    glib::MainContext::default().spawn_local({
-        let scheduler_handle = scheduler_handle.clone();
-        async move {
-            scheduler::run(scheduler_handle).await;
-        }
-    });
-    // Spawned after the scheduler, not before: GLib polls newly spawned tasks
-    // roughly in queue order once the main loop runs, so this ordering gets
-    // the scheduler's first check as early as possible. This probe matters for
-    // the alarm form, which cannot be open this early, so it can run second.
-    glib::MainContext::default().spawn_local({
-        let vibration_available = vibration_available.clone();
-        let brightness_available = brightness_available.clone();
-        async move {
-            if let Ok(conn) = gio::bus_get_future(gio::BusType::Session).await {
-                vibration_available.set(cajole::feedback::vibration_available(&conn).await);
-                brightness_available.set(cajole::display::brightness_available(&conn).await);
-            }
-        }
-    });
-
-    if hidden {
-        // No autostart prompt (it only matters when someone is looking at the
-        // app). The window is built and returned either way; presenting it is
-        // the caller's decision, so every activation goes through one
-        // presenting path.
-        return window;
-    }
-
     maybe_prompt_for_autostart(&window);
     window
 }
@@ -940,8 +1260,7 @@ fn build_alarm_row<W: IsA<gtk4::Window> + Clone + 'static>(
     toast_overlay: &adw::ToastOverlay,
     vibration_available: &Rc<Cell<bool>>,
     brightness_available: &Rc<Cell<bool>>,
-    tracker: &SharedTracker,
-    scheduler_handle_cell: &Rc<RefCell<Option<scheduler::SchedulerHandle>>>,
+    backend: &Backend,
     on_change: RefreshFn,
 ) -> adw::ActionRow {
     let row = adw::ActionRow::builder().activatable(true).build();
@@ -1053,8 +1372,8 @@ fn build_alarm_row<W: IsA<gtk4::Window> + Clone + 'static>(
 
     enabled_switch.connect_state_set({
         let path = path.to_path_buf();
-        let toast_overlay = toast_overlay.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
+        let toast_overlay = toast_overlay.downgrade();
+        let backend = backend.clone();
         let alarm_id = alarm.id;
         let on_change = on_change.clone();
         move |_, new_state| {
@@ -1070,29 +1389,34 @@ fn build_alarm_row<W: IsA<gtk4::Window> + Clone + 'static>(
                     if let Err(err) = store.upsert(updated) {
                         tracing::error!(%err, "failed to toggle alarm enabled state");
                     } else if stays_off {
-                        toast_overlay.add_toast(adw::Toast::new(
-                            "Enabled, but it stays off until Holiday Mode ends",
-                        ));
+                        if let Some(toast_overlay) = toast_overlay.upgrade() {
+                            toast_overlay.add_toast(adw::Toast::new(
+                                "Enabled, but it stays off until Holiday Mode ends",
+                            ));
+                        }
                     }
                 }
             }
-            request_reschedule(&scheduler_handle_cell);
+            backend.request_reschedule();
             on_change();
             glib::Propagation::Proceed
         }
     });
 
     row.connect_activated({
-        let window = window.clone();
+        let window = window.downgrade();
         let path = path.to_path_buf();
-        let toast_overlay = toast_overlay.clone();
+        let toast_overlay = toast_overlay.downgrade();
         let vibration_available = vibration_available.clone();
         let brightness_available = brightness_available.clone();
-        let tracker = tracker.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
+        let backend = backend.clone();
         let alarm = alarm.clone();
         let on_change = on_change.clone();
         move |_| {
+            let (Some(window), Some(toast_overlay)) = (window.upgrade(), toast_overlay.upgrade())
+            else {
+                return;
+            };
             let holiday_bounds = alarm
                 .holiday_only
                 .then(|| {
@@ -1109,8 +1433,7 @@ fn build_alarm_row<W: IsA<gtk4::Window> + Clone + 'static>(
                 toast_overlay.clone(),
                 vibration_available.clone(),
                 brightness_available.clone(),
-                tracker.clone(),
-                scheduler_handle_cell.clone(),
+                backend.clone(),
                 holiday_bounds,
                 None,
             );
@@ -1136,8 +1459,8 @@ fn refresh_list_impl(
     toast_overlay: &adw::ToastOverlay,
     vibration_available: &Rc<Cell<bool>>,
     brightness_available: &Rc<Cell<bool>>,
-    tracker: &SharedTracker,
-    scheduler_handle_cell: &Rc<RefCell<Option<scheduler::SchedulerHandle>>>,
+    backend: &Backend,
+    on_change: &RefreshFn,
 ) {
     tracing::debug!("refresh_list_impl: start");
     while let Some(row) = list_box.row_at_index(0) {
@@ -1174,34 +1497,7 @@ fn refresh_list_impl(
                 } else {
                     list_box
                 };
-                let on_change: RefreshFn = {
-                    let list_box = list_box.clone();
-                    let holiday_list_box = holiday_list_box.clone();
-                    let holiday_group = holiday_group.clone();
-                    let stack = stack.clone();
-                    let path = path.to_path_buf();
-                    let window = window.clone();
-                    let toast_overlay = toast_overlay.clone();
-                    let vibration_available = vibration_available.clone();
-                    let brightness_available = brightness_available.clone();
-                    let tracker = tracker.clone();
-                    let scheduler_handle_cell = scheduler_handle_cell.clone();
-                    Rc::new(move || {
-                        refresh_list_impl(
-                            &list_box,
-                            &holiday_list_box,
-                            holiday_group.upcast_ref(),
-                            &stack,
-                            &path,
-                            &window,
-                            &toast_overlay,
-                            &vibration_available,
-                            &brightness_available,
-                            &tracker,
-                            &scheduler_handle_cell,
-                        );
-                    })
-                };
+                let on_change = on_change.clone();
                 let row = build_alarm_row(
                     alarm,
                     use_12h,
@@ -1211,8 +1507,7 @@ fn refresh_list_impl(
                     toast_overlay,
                     vibration_available,
                     brightness_available,
-                    tracker,
-                    scheduler_handle_cell,
+                    backend,
                     on_change,
                 );
                 target_list_box.append(&row);
@@ -1669,8 +1964,7 @@ fn show_alarm_form<W: IsA<gtk4::Window> + Clone + 'static>(
     toast_overlay: adw::ToastOverlay,
     vibration_available: Rc<Cell<bool>>,
     brightness_available: Rc<Cell<bool>>,
-    tracker: SharedTracker,
-    scheduler_handle_cell: Rc<RefCell<Option<scheduler::SchedulerHandle>>>,
+    backend: Backend,
     holiday_bounds: Option<(NaiveDate, NaiveDate)>,
     on_saved: Option<Rc<dyn Fn(Uuid)>>,
 ) {
@@ -2382,7 +2676,7 @@ fn show_alarm_form<W: IsA<gtk4::Window> + Clone + 'static>(
             let store_path = store_path.clone();
             let refresh_list = refresh_list.clone();
             let delete_armed = delete_armed.clone();
-            let scheduler_handle_cell = scheduler_handle_cell.clone();
+            let backend = backend.clone();
             move |button| {
                 if !delete_armed.get() {
                     delete_armed.set(true);
@@ -2399,7 +2693,7 @@ fn show_alarm_form<W: IsA<gtk4::Window> + Clone + 'static>(
                     }
                     Err(err) => tracing::error!(%err, "failed to load alarm store to delete alarm"),
                 }
-                request_reschedule(&scheduler_handle_cell);
+                backend.request_reschedule();
                 refresh_list();
                 if let Some(window) = button.root().and_then(|r| r.downcast::<adw::Window>().ok()) {
                     window.close();
@@ -2426,8 +2720,7 @@ fn show_alarm_form<W: IsA<gtk4::Window> + Clone + 'static>(
         let store_path = store_path.clone();
         let refresh_list = refresh_list.clone();
         let toast_overlay = toast_overlay.clone();
-        let tracker = tracker.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
+        let backend = backend.clone();
         move |_| {
             let is_pm = time_picker.am_pm.as_ref().map(|t| t.is_pm()).unwrap_or(false);
             let hour = hour_24_from_form(time_picker.hour.value() as u32, is_pm, use_12h);
@@ -2501,8 +2794,7 @@ fn show_alarm_form<W: IsA<gtk4::Window> + Clone + 'static>(
                         // take effect until something else invalidated the
                         // cache. Same reasoning as `scheduler::snooze` and the
                         // `dismiss-alarm-early` action's `forget` calls.
-                        tracker.borrow_mut().forget(alarm.id);
-                        request_reschedule(&scheduler_handle_cell);
+                        backend.alarm_changed(alarm.id);
                         if let Some(next) = cajole::next_trigger(&alarm, chrono::Local::now()) {
                             // Matches GNOME Clocks' "Alarm set for X from now"
                             // toast: shown only for an enabled alarm with a
@@ -2531,67 +2823,17 @@ fn show_alarm_form<W: IsA<gtk4::Window> + Clone + 'static>(
     dialog.present();
 }
 
-/// Handles an alarm being dismissed, whether from the ring dialog's Dismiss
-/// button or a notification's Dismiss action.
-async fn handle_alarm_dismissed(
-    app: &adw::Application,
-    store_path: &std::path::Path,
-    ringing: &RingingMap,
-    open_ring_dialogs: &RingDialogs,
-    refresh_list: &RefreshFn,
-    scheduler_handle: Option<scheduler::SchedulerHandle>,
-    alarm_id: Uuid,
-) {
-    app.withdraw_notification(&alarm_id.to_string());
-    scheduler::dismiss(store_path, ringing, alarm_id).await;
-    if let Some(handle) = scheduler_handle {
-        scheduler::check_and_reschedule(&handle).await;
-    }
-    if let Some(dialog) = open_ring_dialogs.borrow_mut().remove(&alarm_id) {
-        dialog.close();
-    }
-    refresh_list();
-}
-
-/// Handles an alarm being snoozed, whether from the ring dialog's Snooze
-/// button or a notification's Snooze action.
-async fn handle_alarm_snoozed(
-    app: &adw::Application,
-    store_path: &std::path::Path,
-    ringing: &RingingMap,
-    tracker: &SharedTracker,
-    open_ring_dialogs: &RingDialogs,
-    refresh_list: &RefreshFn,
-    scheduler_handle: Option<scheduler::SchedulerHandle>,
-    alarm_id: Uuid,
-) {
-    app.withdraw_notification(&alarm_id.to_string());
-    scheduler::snooze(store_path, ringing, tracker, alarm_id).await;
-    if let Some(handle) = scheduler_handle {
-        scheduler::check_and_reschedule(&handle).await;
-    }
-    if let Some(dialog) = open_ring_dialogs.borrow_mut().remove(&alarm_id) {
-        dialog.close();
-    }
-    refresh_list();
-}
-
-
-/// The ring notification is a system notification with Snooze/Dismiss actions
-/// (see `SchedulerEvent::Ringing`'s handler in `build_ui`), which works from a
-/// locked phone. This dialog is secondary, for when Cajole is already in the
-/// foreground.
+/// The ring screen, shown by the UI process while an alarm rings. The alarm's
+/// real controls are the notification's actions in the background process;
+/// this is for when the phone is in use. The gentle wake glow is a hardware
+/// brightness ramp (see `ring.rs`), not drawn here.
 fn show_ring_dialog(
-    parent: &adw::ApplicationWindow,
     app: &adw::Application,
+    parent: Option<&adw::ApplicationWindow>,
     alarm_id: Uuid,
     label: &str,
-    store_path: PathBuf,
-    ringing: RingingMap,
-    tracker: SharedTracker,
-    open_ring_dialogs: RingDialogs,
-    refresh_list: RefreshFn,
-    scheduler_handle_cell: Rc<RefCell<Option<scheduler::SchedulerHandle>>>,
+    backend: Backend,
+    ring_dialogs: RingDialogs,
 ) {
     let status = adw::StatusPage::builder()
         .title(label)
@@ -2620,82 +2862,33 @@ fn show_ring_dialog(
     content.append(&status);
     content.append(&button_box);
 
-    // Not the alarm's UI on a locked phone: see `SchedulerEvent::Ringing`'s
-    // handler, which sends a system notification with Snooze/Stop actions that
-    // works with no window open, including from the lock screen. The gentle
-    // wake glow is a hardware brightness ramp (see `ring.rs` and
-    // `display::set_screen_brightness`), not drawn here, so it is visible
-    // above the lock screen.
+    // Registered with the application so the UI process stays alive while
+    // the dialog is its only window.
     let dialog = adw::Window::builder()
-        .transient_for(parent)
+        .application(app)
         .modal(true)
         .default_width(360)
         .default_height(640)
         .content(&content)
         .build();
+    if let Some(parent) = parent {
+        dialog.set_transient_for(Some(parent));
+    }
 
+    ring_dialogs.borrow_mut().insert(alarm_id, dialog.clone());
 
-    open_ring_dialogs.borrow_mut().insert(alarm_id, dialog.clone());
-
-    dismiss_button.connect_clicked({
-        let app = app.clone();
-        let store_path = store_path.clone();
-        let ringing = ringing.clone();
-        let open_ring_dialogs = open_ring_dialogs.clone();
-        let refresh_list = refresh_list.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
-        move |_| {
-            let app = app.clone();
-            let store_path = store_path.clone();
-            let ringing = ringing.clone();
-            let open_ring_dialogs = open_ring_dialogs.clone();
-            let refresh_list = refresh_list.clone();
-            let scheduler_handle = scheduler_handle_cell.borrow().clone();
-            glib::MainContext::default().spawn_local(async move {
-                handle_alarm_dismissed(
-                    &app,
-                    &store_path,
-                    &ringing,
-                    &open_ring_dialogs,
-                    &refresh_list,
-                    scheduler_handle,
-                    alarm_id,
-                )
-                .await;
-            });
-        }
-    });
-
-    snooze_button.connect_clicked({
-        let app = app.clone();
-        let ringing = ringing.clone();
-        let tracker = tracker.clone();
-        let open_ring_dialogs = open_ring_dialogs.clone();
-        let refresh_list = refresh_list.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
-        move |_| {
-            let app = app.clone();
-            let ringing = ringing.clone();
-            let tracker = tracker.clone();
-            let store_path = store_path.clone();
-            let open_ring_dialogs = open_ring_dialogs.clone();
-            let refresh_list = refresh_list.clone();
-            let scheduler_handle = scheduler_handle_cell.borrow().clone();
-            glib::MainContext::default().spawn_local(async move {
-                handle_alarm_snoozed(
-                    &app,
-                    &store_path,
-                    &ringing,
-                    &tracker,
-                    &open_ring_dialogs,
-                    &refresh_list,
-                    scheduler_handle,
-                    alarm_id,
-                )
-                .await;
-            });
-        }
-    });
+    for (button, action) in [(&dismiss_button, "dismiss-alarm"), (&snooze_button, "snooze-alarm")] {
+        button.connect_clicked({
+            let backend = backend.clone();
+            let ring_dialogs = ring_dialogs.clone();
+            move |_| {
+                backend.ring_action(action, alarm_id);
+                if let Some(dialog) = ring_dialogs.borrow_mut().remove(&alarm_id) {
+                    dialog.close();
+                }
+            }
+        });
+    }
 
     dialog.present();
 }
@@ -2957,8 +3150,7 @@ fn show_holiday_wizard(
     toast_overlay: adw::ToastOverlay,
     vibration_available: Rc<Cell<bool>>,
     brightness_available: Rc<Cell<bool>>,
-    tracker: SharedTracker,
-    scheduler_handle_cell: Rc<RefCell<Option<scheduler::SchedulerHandle>>>,
+    backend: Backend,
 ) {
     let holiday_settings_path = holiday_path();
     let today = chrono::Local::now().date_naive();
@@ -3166,8 +3358,7 @@ fn show_holiday_wizard(
         let toast_overlay = toast_overlay.clone();
         let vibration_available = vibration_available.clone();
         let brightness_available = brightness_available.clone();
-        let tracker = tracker.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
+        let backend = backend.clone();
         let refresh_list = refresh_list.clone();
         Rc::new(move || {
             while let Some(row) = holiday_alarms_list.row_at_index(0) {
@@ -3208,8 +3399,7 @@ fn show_holiday_wizard(
                         &toast_overlay,
                         &vibration_available,
                         &brightness_available,
-                        &tracker,
-                        &scheduler_handle_cell,
+                        &backend,
                         on_change,
                     );
                     holiday_alarms_list.append(&row);
@@ -3227,8 +3417,7 @@ fn show_holiday_wizard(
         let toast_overlay = toast_overlay.clone();
         let vibration_available = vibration_available.clone();
         let brightness_available = brightness_available.clone();
-        let tracker = tracker.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
+        let backend = backend.clone();
         let start_staged = start_staged.clone();
         let end_staged = end_staged.clone();
         let refresh_holiday_alarms_list = refresh_holiday_alarms_list.clone();
@@ -3273,8 +3462,7 @@ fn show_holiday_wizard(
                 toast_overlay.clone(),
                 vibration_available.clone(),
                 brightness_available.clone(),
-                tracker.clone(),
-                scheduler_handle_cell.clone(),
+                backend.clone(),
                 Some((start, end)),
                 Some(Rc::new(move |id: Uuid| {
                     newly_added_holiday_alarm_ids.borrow_mut().insert(id);
@@ -3355,7 +3543,7 @@ fn show_holiday_wizard(
     let commit_and_close: Rc<dyn Fn()> = {
         let dialog = dialog.clone();
         let refresh_list = refresh_list.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
+        let backend = backend.clone();
         let store_path = store_path.clone();
         let holiday_settings_path = holiday_settings_path.clone();
         let start_staged = start_staged.clone();
@@ -3394,7 +3582,7 @@ fn show_holiday_wizard(
                 }
                 tracing::debug!("holiday wizard: exhausted holiday alarms pruned");
             }
-            request_reschedule(&scheduler_handle_cell);
+            backend.request_reschedule();
             tracing::debug!("holiday wizard: reschedule requested (async, not awaited here)");
             dialog.close();
             tracing::debug!("holiday wizard: dialog closed, deferring main window refresh");
@@ -3470,7 +3658,7 @@ fn show_holiday_wizard(
         let newly_added_holiday_alarm_ids = newly_added_holiday_alarm_ids.clone();
         let original_settings = existing.clone();
         let refresh_list = refresh_list.clone();
-        let scheduler_handle_cell = scheduler_handle_cell.clone();
+        let backend = backend.clone();
         move |_| {
             let mut deleted_any = false;
             if let Ok(mut store) = AlarmStore::load(&store_path) {
@@ -3496,10 +3684,10 @@ fn show_holiday_wizard(
                 // main list in one GTK frame is the suspected cause of the
                 // "Done" freeze, and this path does the same pair of
                 // operations. The mitigation is untested.
-                let scheduler_handle_cell = scheduler_handle_cell.clone();
+                let backend = backend.clone();
                 let refresh_list = refresh_list.clone();
                 glib::idle_add_local_once(move || {
-                    request_reschedule(&scheduler_handle_cell);
+                    backend.request_reschedule();
                     refresh_list();
                 });
             }
