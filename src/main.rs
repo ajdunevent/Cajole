@@ -181,7 +181,11 @@ fn activate_remote_action(
     action: &'static str,
     parameter: Option<glib::Variant>,
 ) {
+    // Held until the call finishes: the UI process exits when its last window
+    // closes, which can be before the call is sent.
+    let hold = gio::Application::default().map(|app| app.hold());
     glib::MainContext::default().spawn_local(async move {
+        let _hold = hold;
         let Ok(conn) = gio::bus_get_future(gio::BusType::Session).await else {
             return;
         };

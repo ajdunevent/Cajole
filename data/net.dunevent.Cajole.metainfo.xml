@@ -42,6 +42,11 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.1.6" date="2026-11-25">
+      <description>
+        <p>Fixed Snooze and Dismiss on the ring screen sometimes doing nothing.</p>
+      </description>
+    </release>
     <release version="0.1.5" date="2026-11-19">
       <description>
         <p>Cajole now uses far less memory while it waits in the background.</p>
