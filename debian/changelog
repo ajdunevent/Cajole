@@ -1,3 +1,9 @@
+cajole (0.1.8-1) unstable; urgency=medium
+
+  * Show the next alarm as the Background portal status message.
+
+ -- AJ Dunevent <aj@dunevent.net>  Wed, 25 Nov 2026 00:00:00 +0000
+
 cajole (0.1.7-1) unstable; urgency=medium
 
   * Start the background process through D-Bus activation, so it keeps

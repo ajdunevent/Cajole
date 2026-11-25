@@ -42,6 +42,11 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.1.8" date="2026-11-25">
+      <description>
+        <p>The desktop's background apps list now shows your next alarm, such as "Next alarm Work, tomorrow at 6:30 AM".</p>
+      </description>
+    </release>
     <release version="0.1.7" date="2026-11-25">
       <description>
         <p>Opening Cajole when its background process isn't running now starts one that keeps running after you close the window.</p>

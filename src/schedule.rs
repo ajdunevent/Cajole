@@ -85,6 +85,80 @@ pub fn next_trigger(alarm: &Alarm, now: DateTime<Local>) -> Option<DateTime<Loca
     None
 }
 
+/// The enabled alarm that rings soonest, skipping occurrences holiday mode
+/// suppresses. A snooze counts as the alarm's next ring.
+pub fn soonest_alarm(
+    alarms: &[Alarm],
+    holiday: &crate::holiday::HolidaySettings,
+    now: DateTime<Local>,
+) -> Option<(String, DateTime<Local>)> {
+    let mut best: Option<(String, DateTime<Local>)> = None;
+    for alarm in alarms {
+        let mut cursor = now;
+        // Two weeks of occurrences is enough to step past any holiday gap that
+        // still leaves a ring on the schedule.
+        for _ in 0..14 {
+            let Some(next) = next_trigger(alarm, cursor) else {
+                break;
+            };
+            if alarm.snoozed_until.is_none()
+                && crate::holiday::should_suppress(alarm, holiday, next.date_naive())
+            {
+                if next <= cursor {
+                    break;
+                }
+                cursor = next;
+                continue;
+            }
+            if best.as_ref().is_none_or(|(_, soonest)| next < *soonest) {
+                best = Some((alarm.label.clone(), next));
+            }
+            break;
+        }
+    }
+    best
+}
+
+/// Longest status message the Background portal accepts.
+const STATUS_MAX_CHARS: usize = 96;
+
+/// The line shown under Cajole in the desktop's background-apps list, for
+/// example "Next alarm Work, tomorrow at 6:30 AM".
+pub fn next_alarm_message(
+    next: Option<(&str, DateTime<Local>)>,
+    now: DateTime<Local>,
+    use_12h: bool,
+) -> String {
+    let Some((label, at)) = next else {
+        return "No upcoming alarms".to_string();
+    };
+    let days_ahead = (at.date_naive() - now.date_naive()).num_days();
+    let day = match days_ahead {
+        ..=0 => "today".to_string(),
+        1 => "tomorrow".to_string(),
+        2..=6 => at.format("%A").to_string(),
+        _ => at.format("%b %-d").to_string(),
+    };
+    let time = at
+        .format(if use_12h { "%l:%M %p" } else { "%H:%M" })
+        .to_string();
+    let tail = format!("{day} at {}", time.trim_start());
+    let label = label.trim();
+    if label.is_empty() {
+        return format!("Next alarm {tail}");
+    }
+    // Truncated to the label alone, so the day and time always survive.
+    let fixed = "Next alarm , ".chars().count() + tail.chars().count();
+    let room = STATUS_MAX_CHARS.saturating_sub(fixed);
+    let label = if label.chars().count() > room {
+        let kept: String = label.chars().take(room.saturating_sub(1)).collect();
+        format!("{kept}…")
+    } else {
+        label.to_string()
+    };
+    format!("Next alarm {label}, {tail}")
+}
+
 /// A "how long until then" string matching GNOME Clocks' "Alarm set for {X} from
 /// now" toast, ported from `show_ring_time_toast` in `alarm-face.vala` (with
 /// `ceil_time_span` and `format_time_span` in `utils.vala`/`cutils.c`).
@@ -192,6 +266,47 @@ mod tests {
 
     fn at(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Local> {
         Local.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
+    }
+
+    #[test]
+    fn status_message_names_day_and_time() {
+        let now = at(2026, 8, 22, 10, 0); // Saturday
+        let msg = |label, when, h12| next_alarm_message(Some((label, when)), now, h12);
+        assert_eq!(msg("Work", at(2026, 8, 22, 18, 5), true), "Next alarm Work, today at 6:05 PM");
+        assert_eq!(msg("Work", at(2026, 8, 23, 6, 30), false), "Next alarm Work, tomorrow at 06:30");
+        assert_eq!(msg("Work", at(2026, 8, 26, 6, 30), true), "Next alarm Work, Wednesday at 6:30 AM");
+        assert_eq!(msg("Work", at(2026, 9, 5, 6, 30), true), "Next alarm Work, Sep 5 at 6:30 AM");
+        assert_eq!(msg("  ", at(2026, 8, 23, 6, 30), true), "Next alarm tomorrow at 6:30 AM");
+        assert_eq!(next_alarm_message(None, now, true), "No upcoming alarms");
+    }
+
+    #[test]
+    fn status_message_truncates_only_the_label() {
+        let now = at(2026, 8, 22, 10, 0);
+        let long = "x".repeat(200);
+        let msg = next_alarm_message(Some((&long, at(2026, 8, 23, 6, 30))), now, true);
+        assert_eq!(msg.chars().count(), 96);
+        assert!(msg.ends_with("…, tomorrow at 6:30 AM"));
+    }
+
+    #[test]
+    fn soonest_alarm_skips_disabled_and_holiday_suppressed() {
+        let now = at(2026, 8, 22, 7, 0);
+        let mut off = Alarm::new("Off", NaiveTime::from_hms_opt(7, 30, 0).unwrap());
+        off.enabled = false;
+        let mut excluded = Alarm::new("Work", NaiveTime::from_hms_opt(8, 0, 0).unwrap());
+        excluded.holiday_excluded = true;
+        let later = Alarm::new("Later", NaiveTime::from_hms_opt(9, 0, 0).unwrap());
+        let holiday = crate::holiday::HolidaySettings {
+            start: NaiveDate::from_ymd_opt(2026, 8, 22),
+            end: NaiveDate::from_ymd_opt(2026, 8, 22),
+            ..Default::default()
+        };
+        let alarms = [off, excluded.clone(), later];
+        assert_eq!(soonest_alarm(&alarms, &holiday, now).unwrap().0, "Later");
+        let none = crate::holiday::HolidaySettings::default();
+        assert_eq!(soonest_alarm(&[excluded], &none, now).unwrap().0, "Work");
+        assert_eq!(soonest_alarm(&[], &none, now), None);
     }
 
     #[test]

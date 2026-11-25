@@ -132,6 +132,38 @@ pub async fn request_background(autostart: bool) -> anyhow::Result<bool> {
     }
 }
 
+/// Sets the status line the desktop shows for this app in its list of
+/// background apps. Does nothing outside a Flatpak, and a portal without
+/// `SetStatus` (Background portal version 1) is ignored.
+pub fn set_background_status(message: &str) {
+    if !is_flatpak() {
+        return;
+    }
+    let message = message.to_owned();
+    glib::MainContext::default().spawn_local(async move {
+        let Ok(conn) = gio::bus_get_future(gio::BusType::Session).await else {
+            return;
+        };
+        let options = glib::VariantDict::new(None);
+        options.insert("message", message.as_str());
+        let result = conn
+            .call_future(
+                Some(PORTAL_BUS_NAME),
+                PORTAL_OBJECT_PATH,
+                BACKGROUND_INTERFACE,
+                "SetStatus",
+                Some(&glib::Variant::tuple_from_iter([options.end()])),
+                None,
+                gio::DBusCallFlags::NONE,
+                -1,
+            )
+            .await;
+        if let Err(err) = result {
+            tracing::debug!(%err, "background status not set");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -54,6 +54,9 @@ pub enum SchedulerEvent {
     /// window, or the window was turned off). The poll loop re-evaluates every
     /// alarm each cycle, so one mechanism covers all of these.
     UpcomingAlarmCleared { alarm_id: Uuid },
+    /// The alarm that will ring soonest, or `None` when nothing is scheduled.
+    /// Sent after every check, so the receiver should ignore repeats.
+    NextAlarm(Option<(String, DateTime<Local>)>),
 }
 
 /// The name systemd knows the transient timer and its service by (`systemd-run
@@ -301,6 +304,20 @@ pub async fn check_and_reschedule(handle: &SchedulerHandle) {
     }
 
     reschedule_wake_timer(handle).await;
+
+    if let Ok(store) = AlarmStore::load(&handle.store_path) {
+        let holiday = handle
+            .store_path
+            .parent()
+            .and_then(|dir| crate::holiday::HolidaySettings::load(dir.join("holiday.json")).ok())
+            .unwrap_or_default();
+        let now = Local::now();
+        (handle.on_event)(SchedulerEvent::NextAlarm(crate::schedule::soonest_alarm(
+            store.alarms(),
+            &holiday,
+            now,
+        )));
+    }
 }
 
 /// How many upcoming moments to schedule wakes for. `systemd-run` accepts

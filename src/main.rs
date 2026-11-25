@@ -480,9 +480,11 @@ fn build_background(app: &gio::Application) {
     //
     // Verifying and rescheduling the wake timer at startup is alarm
     // correctness, so it is first in line for the main loop.
+    let last_status = Rc::new(RefCell::new(String::new()));
     let scheduler_handle = {
         let app = app.clone();
         let after_change = after_change.clone();
+        let last_status = last_status.clone();
         scheduler::SchedulerHandle::new(path.clone(), ringing.clone(), tracker.clone(), move |event| {
             let on_ringing_app = &app;
             let on_ringing_after_change = &after_change;
@@ -529,6 +531,18 @@ fn build_background(app: &gio::Application) {
                     on_ringing_app.withdraw_notification(&alarm_id.to_string());
                     activate_remote_action(UI_APP_ID, "close-ring", Some(alarm_id.to_string().to_variant()));
                     on_ringing_after_change();
+                }
+                scheduler::SchedulerEvent::NextAlarm(next) => {
+                    let now = chrono::Local::now();
+                    let message = cajole::schedule::next_alarm_message(
+                        next.as_ref().map(|(label, at)| (label.as_str(), *at)),
+                        now,
+                        system_uses_12h_clock(),
+                    );
+                    if *last_status.borrow() != message {
+                        cajole::sandbox::set_background_status(&message);
+                        *last_status.borrow_mut() = message;
+                    }
                 }
                 scheduler::SchedulerEvent::UpcomingAlarmCleared { alarm_id } => {
                     on_ringing_app.withdraw_notification(&format!("upcoming-{alarm_id}"));
