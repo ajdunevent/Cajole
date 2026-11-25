@@ -80,6 +80,7 @@
                 "install -Dm644 data/net.dunevent.Cajole.desktop /app/share/applications/net.dunevent.Cajole.desktop",
                 "install -Dm644 data/icons/hicolor/scalable/apps/net.dunevent.Cajole.svg /app/share/icons/hicolor/scalable/apps/net.dunevent.Cajole.svg",
                 "install -Dm644 data/icons/hicolor/symbolic/apps/net.dunevent.Cajole-symbolic.svg /app/share/icons/hicolor/symbolic/apps/net.dunevent.Cajole-symbolic.svg",
+                "install -Dm644 data/net.dunevent.Cajole.service /app/share/dbus-1/services/net.dunevent.Cajole.service",
                 "install -Dm644 data/net.dunevent.Cajole.metainfo.xml /app/share/metainfo/net.dunevent.Cajole.metainfo.xml",
                 "install -Dm644 data/flatpak/org.gnome.settings-daemon.plugins.power.gschema.xml /app/share/glib-2.0/schemas/org.gnome.settings-daemon.plugins.power.gschema.xml",
                 "glib-compile-schemas /app/share/glib-2.0/schemas"

@@ -42,6 +42,11 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.1.7" date="2026-11-25">
+      <description>
+        <p>Opening Cajole when its background process isn't running now starts one that keeps running after you close the window.</p>
+      </description>
+    </release>
     <release version="0.1.6" date="2026-11-25">
       <description>
         <p>Fixed Snooze and Dismiss on the ring screen sometimes doing nothing.</p>

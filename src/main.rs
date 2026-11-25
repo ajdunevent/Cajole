@@ -708,8 +708,10 @@ fn release_freed_memory() {
     });
 }
 
-/// Starts the background process if none is running, so opening the app
-/// still starts alarms.
+/// Makes sure the background process is running, so opening the app still
+/// starts alarms. A message to its bus name starts it through the `.service`
+/// file as its own process; spawning it from here would tie it to this
+/// process's sandbox, which ends when the UI exits.
 fn ensure_background_running() {
     glib::MainContext::default().spawn_local(async {
         let Ok(conn) = gio::bus_get_future(gio::BusType::Session).await else {
@@ -717,21 +719,18 @@ fn ensure_background_running() {
         };
         let reply = conn
             .call_future(
-                Some("org.freedesktop.DBus"),
-                "/org/freedesktop/DBus",
-                "org.freedesktop.DBus",
-                "NameHasOwner",
-                Some(&(APP_ID,).to_variant()),
+                Some(APP_ID),
+                &dbus_object_path(APP_ID),
+                "org.freedesktop.DBus.Peer",
+                "Ping",
+                None,
                 None,
                 gio::DBusCallFlags::NONE,
                 -1,
             )
             .await;
-        let running = reply
-            .ok()
-            .and_then(|v| v.child_value(0).get::<bool>())
-            .unwrap_or(false);
-        if !running {
+        if let Err(err) = reply {
+            tracing::warn!(%err, "bus activation of the background process failed");
             spawn_self(&["--hidden"]);
         }
     });

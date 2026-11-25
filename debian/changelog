@@ -1,3 +1,10 @@
+cajole (0.1.7-1) unstable; urgency=medium
+
+  * Start the background process through D-Bus activation, so it keeps
+    running after the window closes when the app was opened without it.
+
+ -- AJ Dunevent <aj@dunevent.net>  Wed, 25 Nov 2026 00:00:00 +0000
+
 cajole (0.1.6-1) unstable; urgency=medium
 
   * Fix Snooze and Dismiss on the ring screen being lost when the UI process

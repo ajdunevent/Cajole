@@ -8,11 +8,13 @@ matching `.desktop` file, with no error at the D-Bus level. GNOME's
 `Exec=cajole` must also resolve on `$PATH`. GIO treats a `.desktop` file whose
 `Exec=` cannot be resolved as if it did not exist.
 
-There is no D-Bus `.service` file and no `DBusActivatable`. Cajole is meant to
-run continuously from its autostart entry (`src/autostart.rs`) and holds the
-application open from `main()`. A `.service` file added a second way to start
-the app at login, and was removed after three `cajole` processes were seen
-lingering with no window.
+`net.dunevent.Cajole.service` is for the Flatpak only. It starts
+`cajole --hidden` through bus activation, which Flatpak exports as a separate
+sandbox instance. The UI uses it to start the background process: a process
+the UI spawns itself dies when the UI's sandbox exits. There is no
+`DBusActivatable` in the `.desktop` file. An earlier `.service` file for the
+windowed app was removed after three `cajole` processes were seen lingering
+with no window.
 
 ## Installing for local testing
 
